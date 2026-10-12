@@ -1,0 +1,14 @@
+.gradle/
+build/
+run/
+.idea/
+*.iml
+.vscode/
+*.log
+AGENTS.md
+.codex/
+.env
+.env.*
+*.litematic
+*.litematica
+.cloudarchive-archive-*.tmp

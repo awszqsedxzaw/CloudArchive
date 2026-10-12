@@ -1,0 +1,85 @@
+plugins {
+    id 'fabric-loom' version "${loom_version}"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+}
+
+loom {
+    runs {
+        client {
+            runDir 'run/client'
+        }
+        server {
+            runDir 'run/server'
+        }
+    }
+}
+
+processResources {
+    def metadata = [
+        mod_id: project.mod_id,
+        mod_name: project.mod_name,
+        version: project.version,
+        minecraft_version: project.minecraft_version,
+        loader_version: project.loader_version,
+        fabric_api_version: project.fabric_api_version
+    ]
+    inputs.properties metadata
+    filteringCharset = 'UTF-8'
+    filesMatching('fabric.mod.json') {
+        expand metadata
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 17
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+    withSourcesJar()
+}
+
+tasks.withType(Jar).configureEach {
+    from('LICENSE') {
+        rename { "${it}_${project.archives_base_name}" }
+    }
+}
+
+tasks.register('runFileCodec', JavaExec) {
+    group = 'application'
+    description = 'Packs or restores a file in a Litematica schematic.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'awszqsedxzaw.cloudarchive.codec.FileCodecCli'
+}
+
+tasks.register('verifyFileCodec', JavaExec) {
+    group = 'verification'
+    description = 'Runs file codec round-trip and format checks.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'awszqsedxzaw.cloudarchive.codec.FileCodecSelfTest'
+    maxHeapSize = '128m'
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('verifyFileCodec')
+}
