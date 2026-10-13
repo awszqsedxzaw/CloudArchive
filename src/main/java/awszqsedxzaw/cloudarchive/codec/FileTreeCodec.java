@@ -1,10 +1,10 @@
 package awszqsedxzaw.cloudarchive.codec;
 
+import awszqsedxzaw.cloudarchive.codec.TreeArchiveFormat.ArchiveKind;
 import awszqsedxzaw.cloudarchive.codec.TreeArchiveFormat.Extent;
 import awszqsedxzaw.cloudarchive.codec.TreeArchiveFormat.Manifest;
 import awszqsedxzaw.cloudarchive.codec.TreeArchiveFormat.Node;
-import java.io.BufferedOutputStream;
-import java.io.DataOutputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -53,52 +53,99 @@ public final class FileTreeCodec {
             throw new IOException("Tree output must be outside the source root");
         }
         Snapshot snapshot = collect(source, selections);
+        return packSnapshot(source, snapshot, destination, ArchiveKind.TREE,
+                source.getFileName() == null ? "File tree" : source.getFileName().toString());
+    }
+
+    static Summary packSingleFile(Path input, Path output) throws IOException {
+        Path source = input.toAbsolutePath().normalize();
+        rejectLinkedAncestors(source);
+        if (!Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("Input is not a regular file: " + source);
+        }
+        Path destination = LitematicaFileCodec.normalizeSchematicPath(output).toAbsolutePath().normalize();
+        if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS)) {
+            throw new FileAlreadyExistsException(destination.toString());
+        }
+        rejectLinkedAncestors(destination.getParent());
+        BasicFileAttributes attributes = readSourceAttributes(source);
+        String hash = LitematicaFileCodec.sha256(source);
+        requireUnchanged(source, attributes);
+        Snapshot snapshot = new Snapshot(List.of(source), Map.of(source, attributes), Map.of(source, hash));
+        return packSnapshot(source.getParent(), snapshot, destination, ArchiveKind.FILE,
+                source.getFileName().toString());
+    }
+
+    private static Summary packSnapshot(
+            Path root,
+            Snapshot snapshot,
+            Path destination,
+            ArchiveKind kind,
+            String archiveName
+    ) throws IOException {
         long contentSize = 0;
         List<Node> nodes = new ArrayList<>();
         Map<Path, Long> ids = new HashMap<>();
-        ids.put(source, 0L);
-        long nextId = 1;
-        for (Path path : snapshot.paths()) {
-            BasicFileAttributes attributes = snapshot.attributes().get(path);
-            TreeArchiveFormat.validateName(path.getFileName().toString());
-            Long parentId = ids.get(path.getParent());
-            if (parentId == null) {
-                throw new IOException("Source parent directory is missing");
-            }
-            long size = attributes.isDirectory() ? 0 : attributes.size();
-            List<Extent> extents = size == 0 ? List.of() : List.of(new Extent(contentSize, size));
-            nodes.add(new Node(nextId, parentId, path.getFileName().toString(), attributes.isDirectory(),
-                    size, extents));
-            ids.put(path, nextId++);
-            contentSize = TreeArchiveFormat.add(contentSize, size);
+        if (kind == ArchiveKind.TREE) {
+            ids.put(root, 0L);
         }
-        long payloadSize = TreeArchiveFormat.add(TreeArchiveFormat.indexSize(nodes), contentSize);
-        LitematicaFileCodec.bookCountForSize(payloadSize);
-        TreeArchiveFormat.validate(nodes, contentSize, nextId);
+        long nextId = 1;
         Path work = Files.createTempDirectory(".cloudarchive-tree-");
         try {
-            Path payload = work.resolve("payload");
-            try (DataOutputStream stream = new DataOutputStream(
-                    new BufferedOutputStream(Files.newOutputStream(payload, StandardOpenOption.CREATE_NEW)))) {
-                TreeArchiveFormat.writeHeader(stream, nodes, contentSize, nextId);
+            Path metadata = work.resolve("metadata");
+            Path data = work.resolve("data");
+            try (FileOutputStream dataOutput = new FileOutputStream(data.toFile())) {
                 for (Path path : snapshot.paths()) {
-                    if (!snapshot.attributes().get(path).isDirectory()) {
-                        copyVerifiedSource(path, snapshot.attributes().get(path), snapshot.hashes().get(path), stream);
+                    BasicFileAttributes attributes = snapshot.attributes().get(path);
+                    if (kind == ArchiveKind.FILE) {
+                        TreeArchiveFormat.validateName(path.getFileName().toString());
+                        String hash = snapshot.hashes().get(path);
+                        nodes.add(new Node(nextId++, 0, path.getFileName().toString(), false,
+                                attributes.size(), hash,
+                                attributes.size() == 0 ? List.of() : List.of(new Extent(0, attributes.size()))));
+                        copyVerifiedSource(path, attributes, hash, dataOutput);
+                        contentSize = attributes.size();
+                        break;
+                    }
+                    TreeArchiveFormat.validateName(path.getFileName().toString());
+                    Long parentId = ids.get(path.getParent());
+                    if (parentId == null) {
+                        throw new IOException("Source parent directory is missing");
+                    }
+                    boolean directory = attributes.isDirectory();
+                    long size = directory ? 0 : attributes.size();
+                    String hash = directory ? "" : snapshot.hashes().get(path);
+                    List<Extent> extents = directory || size == 0
+                            ? List.of() : List.of(new Extent(contentSize, size));
+                    nodes.add(new Node(nextId, parentId, path.getFileName().toString(),
+                            directory, size, hash, extents));
+                    ids.put(path, nextId++);
+                    if (!directory) {
+                        copyVerifiedSource(path, attributes, hash, dataOutput);
+                        contentSize = TreeArchiveFormat.add(contentSize, size);
                     }
                 }
-                TreeArchiveFormat.writeNodes(stream, nodes);
             }
-            String name = source.getFileName() == null ? "File tree" : source.getFileName().toString();
-            LitematicaFileCodec.ArchiveInfo archive = LitematicaFileCodec.packPayload(
-                    payload, destination, name, LitematicaFileCodec.TREE_FORMAT);
+            String dataHash = LitematicaFileCodec.sha256(data);
+            TreeArchiveFormat.validate(kind, archiveName, nodes, contentSize, nextId);
+            TreeArchiveFormat.write(metadata, kind, archiveName, nodes, contentSize, dataHash, nextId);
+            LitematicaFileCodec.ArchiveInfo archive = LitematicaFileCodec.packArchive(
+                    metadata, data, destination, kind);
             return summary(archive, nodes);
         } finally {
             deleteWorkDirectory(work);
         }
     }
 
-    // Reconstruct the transport once, then dispatch by its explicit format marker.
     public static Summary restore(Path input, Path output) throws IOException {
+        return restore(input, output, false);
+    }
+
+    static Summary restoreSingle(Path input, Path output) throws IOException {
+        return restore(input, output, true);
+    }
+
+    private static Summary restore(Path input, Path output, boolean singleFileOnly) throws IOException {
         Path destination = output.toAbsolutePath().normalize();
         if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS)) {
             throw new FileAlreadyExistsException(destination.toString());
@@ -107,22 +154,24 @@ public final class FileTreeCodec {
         if (parent == null) {
             throw new IOException("Output path has no parent directory");
         }
-        Files.createDirectories(parent);
         rejectLinkedAncestors(parent);
+        Files.createDirectories(parent);
         Path work = Files.createTempDirectory(parent, ".cloudarchive-tree-");
         try {
-            Path payload = work.resolve("payload");
-            LitematicaFileCodec.ArchiveInfo archive = LitematicaFileCodec.restorePayload(input, payload, null);
-            if (archive.format().equals(LitematicaFileCodec.FILE_FORMAT)) {
-                Files.move(payload, destination);
-                return new Summary(archive, 1, 0, archive.fileSize());
+            LitematicaFileCodec.DecodedArchive decoded = decode(input, work);
+            if (singleFileOnly && decoded.manifest().kind() != ArchiveKind.FILE) {
+                throw new IOException("Input is a directory-tree archive, not a single-file archive");
             }
-            Manifest manifest = TreeArchiveFormat.read(payload);
-            Summary result = summary(archive, manifest.nodes());
+            if (decoded.manifest().kind() == ArchiveKind.FILE) {
+                Path staged = work.resolve("file");
+                extractSingle(decoded.manifest(), work.resolve("data"), staged);
+                Files.move(staged, destination);
+                return new Summary(decoded.info(), 1, 0, decoded.manifest().dataLength());
+            }
             Path tree = Files.createDirectory(work.resolve("tree"));
-            extract(payload, manifest, tree);
+            extract(decoded.manifest(), work.resolve("data"), tree);
             Files.move(tree, destination);
-            return result;
+            return summary(decoded.info(), decoded.manifest().nodes());
         } finally {
             deleteWorkDirectory(work);
         }
@@ -131,23 +180,35 @@ public final class FileTreeCodec {
     public static Listing list(Path input) throws IOException {
         Path work = Files.createTempDirectory(".cloudarchive-tree-");
         try {
-            Path payload = work.resolve("payload");
-            LitematicaFileCodec.ArchiveInfo archive = LitematicaFileCodec.restorePayload(input, payload, null);
-            if (archive.format().equals(LitematicaFileCodec.FILE_FORMAT)) {
-                return new Listing(new Summary(archive, 1, 0, archive.fileSize()),
-                        List.of(new Entry(1, 0, archive.fileName(), false, archive.fileSize())));
+            LitematicaFileCodec.DecodedArchive decoded = decode(input, work);
+            try (FileChannel source = FileChannel.open(work.resolve("data"), StandardOpenOption.READ)) {
+                for (Node node : decoded.manifest().nodes()) {
+                    if (!node.directory()) {
+                        verifyHash(node, copyExtents(source, null, node.extents()));
+                    }
+                }
             }
-            Manifest manifest = TreeArchiveFormat.read(payload);
+            if (decoded.manifest().kind() == ArchiveKind.FILE) {
+                return new Listing(new Summary(decoded.info(), 1, 0, decoded.manifest().dataLength()),
+                        List.of(new Entry(decoded.manifest().nodes().get(0).id(), 0,
+                                decoded.manifest().nodes().get(0).name(), false, decoded.manifest().dataLength())));
+            }
             List<Entry> entries = new ArrayList<>();
-            for (Node node : manifest.nodes()) {
+            for (Node node : decoded.manifest().nodes()) {
                 entries.add(new Entry(node.id(), node.parentId(),
-                        manifest.paths().get(node.id()).toString().replace('\\', '/'),
+                        decoded.manifest().paths().get(node.id()).toString().replace('\\', '/'),
                         node.directory(), node.size()));
             }
-            return new Listing(summary(archive, manifest.nodes()), List.copyOf(entries));
+            return new Listing(summary(decoded.info(), decoded.manifest().nodes()), List.copyOf(entries));
         } finally {
             deleteWorkDirectory(work);
         }
+    }
+
+    private static LitematicaFileCodec.DecodedArchive decode(Path input, Path work) throws IOException {
+        Path metadata = work.resolve("metadata");
+        Path data = work.resolve("data");
+        return LitematicaFileCodec.restoreTransport(input, metadata, data);
     }
 
     private static Snapshot collect(Path root, List<Path> selections) throws IOException {
@@ -248,7 +309,7 @@ public final class FileTreeCodec {
                 LinkOption.NOFOLLOW_LINKS);
         if (attributes.isSymbolicLink() || attributes.isOther()
                 || !(attributes.isDirectory() || attributes.isRegularFile())) {
-            throw new IOException("Links and special files are not supported: " + path);
+            throw new IOException("Links and special paths are not supported: " + path);
         }
         return attributes;
     }
@@ -278,9 +339,16 @@ public final class FileTreeCodec {
         }
     }
 
-    private static void extract(Path payload, Manifest manifest, Path root) throws IOException {
-        ByteBuffer buffer = ByteBuffer.allocate(64 * 1024);
-        try (FileChannel source = FileChannel.open(payload, StandardOpenOption.READ)) {
+    private static void extractSingle(Manifest manifest, Path data, Path output) throws IOException {
+        Node node = manifest.nodes().get(0);
+        try (FileChannel source = FileChannel.open(data, StandardOpenOption.READ);
+             FileChannel target = FileChannel.open(output, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+            verifyHash(node, copyExtents(source, target, node.extents()));
+        }
+    }
+
+    private static void extract(Manifest manifest, Path data, Path root) throws IOException {
+        try (FileChannel source = FileChannel.open(data, StandardOpenOption.READ)) {
             for (Node node : manifest.nodes()) {
                 Path target = root.resolve(manifest.paths().get(node.id())).normalize();
                 if (!target.startsWith(root)) {
@@ -288,33 +356,56 @@ public final class FileTreeCodec {
                 }
                 if (node.directory()) {
                     Files.createDirectory(target);
-                    continue;
-                }
-                try (FileChannel output = FileChannel.open(target,
-                        StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW)) {
-                    for (Extent extent : node.extents()) {
-                        source.position(TreeArchiveFormat.HEADER_BYTES + extent.offset());
-                        long remaining = extent.length();
-                        while (remaining > 0) {
-                            buffer.clear();
-                            buffer.limit((int) Math.min(buffer.capacity(), remaining));
-                            int count = source.read(buffer);
-                            if (count < 0) {
-                                throw new IOException("Tree extent data is truncated");
-                            }
-                            buffer.flip();
-                            while (buffer.hasRemaining()) {
-                                output.write(buffer);
-                            }
-                            remaining -= count;
-                        }
+                } else {
+                    try (FileChannel output = FileChannel.open(target,
+                            StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+                        verifyHash(node, copyExtents(source, output, node.extents()));
                     }
                 }
             }
         }
     }
 
-    private static Summary summary(LitematicaFileCodec.ArchiveInfo archive, List<Node> nodes) throws IOException {
+    private static String copyExtents(FileChannel source, FileChannel output, List<Extent> extents)
+            throws IOException {
+        MessageDigest digest;
+        try {
+            digest = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException exception) {
+            throw new IllegalStateException(exception);
+        }
+        ByteBuffer buffer = ByteBuffer.allocate(64 * 1024);
+        for (Extent extent : extents) {
+            source.position(extent.offset());
+            long remaining = extent.length();
+            while (remaining > 0) {
+                buffer.clear();
+                buffer.limit((int) Math.min(buffer.capacity(), remaining));
+                int count = source.read(buffer);
+                if (count < 0) {
+                    throw new IOException("Archive data extent is truncated");
+                }
+                buffer.flip();
+                digest.update(buffer.asReadOnlyBuffer());
+                if (output != null) {
+                    while (buffer.hasRemaining()) {
+                        output.write(buffer);
+                    }
+                }
+                remaining -= count;
+            }
+        }
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    private static void verifyHash(Node node, String actual) throws IOException {
+        if (!actual.equals(node.sha256())) {
+            throw new IOException("File SHA-256 does not match metadata: " + node.name());
+        }
+    }
+
+    private static Summary summary(LitematicaFileCodec.ArchiveInfo archive, List<Node> nodes)
+            throws IOException {
         int files = 0;
         int directories = 0;
         long contentSize = 0;
@@ -354,7 +445,8 @@ public final class FileTreeCodec {
         });
     }
 
-    private record Snapshot(List<Path> paths, Map<Path, BasicFileAttributes> attributes, Map<Path, String> hashes) {
+    private record Snapshot(List<Path> paths, Map<Path, BasicFileAttributes> attributes,
+                            Map<Path, String> hashes) {
     }
 
     public record Summary(LitematicaFileCodec.ArchiveInfo archive, int fileCount, int directoryCount,

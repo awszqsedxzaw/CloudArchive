@@ -4,8 +4,6 @@ import java.io.BufferedOutputStream;
 import java.io.DataOutput;
 import java.io.DataOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.FileAlreadyExistsException;
@@ -19,10 +17,10 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.Map;
+import java.util.Set;
 import java.util.zip.GZIPOutputStream;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
-import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtList;
 import net.minecraft.nbt.NbtString;
 
@@ -35,13 +33,12 @@ public final class LitematicaFileCodec {
     public static final int BYTES_PER_PAGE = MAX_PAGE_CHARS / 4 * 3;
     public static final long BYTES_PER_BOOK = (long) BYTES_PER_PAGE * MAX_PAGES_PER_BOOK;
     public static final long BYTES_PER_BARREL = BYTES_PER_BOOK * INVENTORY_SLOTS;
-    public static final String MOD_TAG = "CloudArchive";
-
-    private static final long MAX_FILE_SIZE = BYTES_PER_BOOK * Integer.MAX_VALUE;
-    private static final String BOOK_ID = "minecraft:written_book";
-    private static final String BARREL_ID = "minecraft:barrel";
-    static final String FILE_FORMAT = "file-archive-v2";
-    static final String TREE_FORMAT = "tree-archive-v1";
+    static final long MAX_ARCHIVE_BYTES = BYTES_PER_BOOK * Integer.MAX_VALUE;
+    static final String BOOK_ID = "minecraft:written_book";
+    static final String BARREL_ID = "minecraft:barrel";
+    private static final String AUTHOR = "CloudArchive";
+    private static final String METADATA_TITLE = "Metadata";
+    private static final String DATA_TITLE = "Data";
     private static final Base64.Encoder BASE64_ENCODER = Base64.getUrlEncoder().withoutPadding();
     private static final Base64.Decoder BASE64_DECODER = Base64.getUrlDecoder();
 
@@ -49,48 +46,83 @@ public final class LitematicaFileCodec {
     }
 
     public static ArchiveInfo pack(Path input, Path output) throws IOException {
-        return packPayload(input, output, input.toAbsolutePath().getFileName().toString(), FILE_FORMAT);
+        return FileTreeCodec.packSingleFile(input, output).archive();
     }
 
-    static ArchiveInfo packPayload(Path input, Path output, String name, String format) throws IOException {
-        if (!FILE_FORMAT.equals(format) && !TREE_FORMAT.equals(format)) {
-            throw new IOException("Unsupported archive format: " + format);
+    public static ArchiveInfo restore(Path input, Path output) throws IOException {
+        return FileTreeCodec.restoreSingle(input, output).archive();
+    }
+
+    static ArchiveInfo packArchive(
+            Path metadata,
+            Path data,
+            Path destination,
+            TreeArchiveFormat.ArchiveKind expectedKind
+    ) throws IOException {
+        Path metadataPath = metadata.toAbsolutePath().normalize();
+        Path dataPath = data.toAbsolutePath().normalize();
+        Path schematic = normalizeSchematicPath(destination).toAbsolutePath().normalize();
+        if (!Files.isRegularFile(metadataPath) || !Files.isRegularFile(dataPath)) {
+            throw new IOException("Archive staging files are not regular files");
         }
+        if (Files.exists(schematic, LinkOption.NOFOLLOW_LINKS)) {
+            throw new FileAlreadyExistsException(schematic.toString());
+        }
+        TreeArchiveFormat.Manifest manifest = TreeArchiveFormat.read(metadataPath);
+        if (manifest.kind() != expectedKind || manifest.dataLength() != Files.size(dataPath)
+                || !sha256(dataPath).equals(manifest.dataSha256())) {
+            throw new IOException("Archive staging metadata and data do not match");
+        }
+        int metadataBooks = TreeArchiveFormat.metadataBookCount(Files.size(metadataPath));
+        if (metadataBooks > INVENTORY_SLOTS) {
+            throw new IOException("Metadata needs more than one barrel");
+        }
+        int dataBooks = TreeArchiveFormat.dataBookCount(manifest.dataLength());
+        int barrelCount = 1 + barrelCountForBooks(dataBooks);
+        writeCompressedAtomically(metadataPath, dataPath, schematic, manifest.archiveName(),
+                metadataBooks, dataBooks, barrelCount);
+        return new ArchiveInfo(manifest.archiveName(), manifest.dataLength(), manifest.dataSha256(),
+                metadataBooks, dataBooks, barrelCount, manifest.kind());
+    }
+
+    static DecodedArchive restoreTransport(
+            Path input,
+            Path metadataOutput,
+            Path dataOutput
+    ) throws IOException {
         Path source = input.toAbsolutePath().normalize();
-        Path destination = normalizeSchematicPath(output).toAbsolutePath().normalize();
-
         if (!Files.isRegularFile(source)) {
-            throw new IOException("Input is not a regular file: " + source);
+            throw new IOException("Schematic is not a regular file: " + source);
         }
-        if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS)) {
-            throw new FileAlreadyExistsException(destination.toString());
+        ArchiveLayoutScanner.Layout layout = ArchiveLayoutScanner.read(source);
+        RestoreState state;
+        try (FileChannel metadata = FileChannel.open(metadataOutput,
+                StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+             FileChannel data = FileChannel.open(dataOutput,
+                     StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+            state = new RestoreState(metadata, data);
+            ArchiveBookScanner scanner = new ArchiveBookScanner(layout, state::acceptBook);
+            try {
+                net.minecraft.nbt.NbtIo.scanCompressed(source.toFile(), scanner);
+            } catch (java.io.UncheckedIOException exception) {
+                throw exception.getCause();
+            }
+            NbtElement rootElement = scanner.getRoot();
+            if (!(rootElement instanceof NbtCompound root)
+                    || !root.contains("Version", NbtElement.INT_TYPE)
+                    || root.getInt("Version") != 6
+                    || !root.contains("Regions", NbtElement.COMPOUND_TYPE)) {
+                throw new IOException("Input is not a supported 1.20.1 Litematica schematic");
+            }
+            metadata.force(false);
+            data.force(false);
+            state.finish(metadataOutput, dataOutput, layout.barrelCount());
         }
-
-        long fileSize = Files.size(source);
-        int bookCount = bookCountForSize(fileSize);
-        String fileName = name;
-        // Hash first so only the first book needs the complete file header.
-        String sha256 = sha256(source);
-        NbtCompound header = new NbtCompound();
-        header.putString("file_name", fileName);
-        header.putLong("file_size", fileSize);
-        header.putString("sha256", sha256);
-        header.putInt("book_count", bookCount);
-
-        writeCompressedAtomically(source, destination, fileSize, bookCount, header, format);
-        return new ArchiveInfo(fileName, fileSize, sha256, bookCount, format);
-    }
-
-    static int bookCountForSize(long fileSize) throws IOException {
-        if (fileSize < 0 || fileSize > MAX_FILE_SIZE) {
-            throw new IOException("File size exceeds the archive's integer book index range");
-        }
-        return (int) Math.max(1, fileSize / BYTES_PER_BOOK
-                + (fileSize % BYTES_PER_BOOK == 0 ? 0 : 1));
-    }
-
-    private static int barrelCountForBooks(int bookCount) {
-        return (int) (((long) bookCount + INVENTORY_SLOTS - 1) / INVENTORY_SLOTS);
+        TreeArchiveFormat.Manifest manifest = TreeArchiveFormat.read(metadataOutput);
+        ArchiveInfo info = new ArchiveInfo(manifest.archiveName(), manifest.dataLength(),
+                manifest.dataSha256(), TreeArchiveFormat.metadataBookCount(Files.size(metadataOutput)),
+                manifest.dataBookCount(), 1 + barrelCountForBooks(manifest.dataBookCount()), manifest.kind());
+        return new DecodedArchive(manifest, info);
     }
 
     public static Path normalizeSchematicPath(Path output) {
@@ -98,7 +130,6 @@ public final class LitematicaFileCodec {
         if (fileName == null) {
             return output.resolveSibling(output + SCHEMATIC_EXTENSION);
         }
-
         String name = fileName.toString();
         if (name.endsWith(SCHEMATIC_EXTENSION)) {
             return output;
@@ -109,62 +140,16 @@ public final class LitematicaFileCodec {
         return output.resolveSibling(name + SCHEMATIC_EXTENSION);
     }
 
-    public static ArchiveInfo restore(Path input, Path output) throws IOException {
-        return restorePayload(input, output, FILE_FORMAT);
+    static int barrelCountForBooks(int bookCount) {
+        return (int) (((long) bookCount + INVENTORY_SLOTS - 1) / INVENTORY_SLOTS);
     }
 
-    static ArchiveInfo restorePayload(Path input, Path output, String expectedFormat) throws IOException {
-        Path source = input.toAbsolutePath().normalize();
-        Path destination = output.toAbsolutePath().normalize();
-        if (!Files.isRegularFile(source)) {
-            throw new IOException("Schematic is not a regular file: " + source);
-        }
-        if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS)) {
-            throw new FileAlreadyExistsException(destination.toString());
-        }
-
-        Path temporary = createTemporaryFile(destination);
-        boolean moved = false;
-        try {
-            ArchiveInfo info;
-            try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.WRITE)) {
-                RestoreState state = new RestoreState(channel, expectedFormat);
-                ArchiveBookScanner scanner = new ArchiveBookScanner(state::acceptBook);
-                try {
-                    NbtIo.scanCompressed(source.toFile(), scanner);
-                } catch (UncheckedIOException exception) {
-                    throw exception.getCause();
-                }
-                NbtCompound root = (NbtCompound) scanner.getRoot();
-                if (root == null || !root.contains("Version", NbtElement.INT_TYPE)
-                        || root.getInt("Version") < 1 || root.getInt("Version") > 6
-                        || !root.contains("Regions", NbtElement.COMPOUND_TYPE)) {
-                    throw new IOException("Input is not a supported Litematica schematic");
-                }
-                info = state.finish();
-            }
-
-            if (!sha256(temporary).equals(info.sha256())) {
-                throw new IOException("Archive size or SHA-256 verification failed");
-            }
-            moveWithoutReplacing(temporary, destination);
-            moved = true;
-            return info;
-        } finally {
-            if (!moved) {
-                Files.deleteIfExists(temporary);
-            }
-        }
-    }
-
-    static NbtCompound createSchematic(String fileName, int bookCount) {
+    static NbtCompound createSchematic(String name, int barrelCount) {
         long now = System.currentTimeMillis();
-        int barrelCount = barrelCountForBooks(bookCount);
-
         NbtCompound metadata = new NbtCompound();
-        metadata.putString("Name", fileName);
-        metadata.putString("Author", "CloudArchive");
-        metadata.putString("Description", "File archive");
+        metadata.putString("Name", name);
+        metadata.putString("Author", AUTHOR);
+        metadata.putString("Description", "CloudArchive data and metadata barrels");
         metadata.putInt("RegionCount", 1);
         metadata.putInt("TotalVolume", barrelCount);
         metadata.putInt("TotalBlocks", barrelCount);
@@ -173,7 +158,6 @@ public final class LitematicaFileCodec {
         metadata.put("EnclosingSize", positionTag(barrelCount, 1, 1));
 
         NbtList palette = new NbtList();
-        // Litematica initializes its palette with air at index zero before reading it.
         NbtCompound airState = new NbtCompound();
         airState.putString("Name", "minecraft:air");
         palette.add(airState);
@@ -185,9 +169,10 @@ public final class LitematicaFileCodec {
         barrelState.put("Properties", barrelProperties);
         palette.add(barrelState);
 
-        long[] blockStates = new long[(int) (((long) barrelCount + 31) / 32)];
+        long[] blockStates = new long[(int) (((long) barrelCount * 2 + 63) / 64)];
         for (int barrelIndex = 0; barrelIndex < barrelCount; barrelIndex++) {
-            blockStates[barrelIndex / 32] |= 1L << (barrelIndex % 32 * 2);
+            int bitOffset = barrelIndex * 2;
+            blockStates[bitOffset / Long.SIZE] |= 1L << (bitOffset % Long.SIZE);
         }
         NbtCompound region = new NbtCompound();
         region.put("BlockStatePalette", palette);
@@ -198,7 +183,6 @@ public final class LitematicaFileCodec {
 
         NbtCompound regions = new NbtCompound();
         regions.put("FileStorage", region);
-
         NbtCompound schematic = new NbtCompound();
         schematic.putInt("MinecraftDataVersion", 3465);
         schematic.putInt("Version", 6);
@@ -208,44 +192,28 @@ public final class LitematicaFileCodec {
         return schematic;
     }
 
-    private static NbtCompound positionTag(int x, int y, int z) {
-        NbtCompound position = new NbtCompound();
-        position.putInt("x", x);
-        position.putInt("y", y);
-        position.putInt("z", z);
-        return position;
-    }
-
-    private static byte[] decodePage(String page) throws IOException {
-        for (int i = 0; i < page.length(); i++) {
-            char character = page.charAt(i);
-            boolean valid = character >= 'A' && character <= 'Z'
-                    || character >= 'a' && character <= 'z'
-                    || character >= '0' && character <= '9'
-                    || character == '-' || character == '_';
-            if (!valid) {
-                throw new IOException("Archive page contains invalid Base64 data");
-            }
-        }
-
-        try {
-            return BASE64_DECODER.decode(page);
-        } catch (IllegalArgumentException exception) {
-            throw new IOException("Archive page contains invalid Base64 data", exception);
-        }
-    }
-
     private static void writeCompressedAtomically(
-            Path source, Path destination, long fileSize, int bookCount, NbtCompound header, String format
+            Path metadata,
+            Path data,
+            Path destination,
+            String archiveName,
+            int metadataBookCount,
+            int dataBookCount,
+            int barrelCount
     ) throws IOException {
-        Path temporary = createTemporaryFile(destination);
+        Path parent = destination.getParent();
+        if (parent == null) {
+            throw new IOException("Output path has no parent directory");
+        }
+        Files.createDirectories(parent);
+        Path temporary = Files.createTempFile(parent, ".cloudarchive-archive-", ".tmp");
         boolean moved = false;
         try {
-            MessageDigest digest = newSha256();
-            try (InputStream stream = Files.newInputStream(source);
+            try (FileChannel metadataChannel = FileChannel.open(metadata, StandardOpenOption.READ);
+                 FileChannel dataChannel = FileChannel.open(data, StandardOpenOption.READ);
                  DataOutputStream output = new DataOutputStream(new BufferedOutputStream(
                          new GZIPOutputStream(Files.newOutputStream(temporary), 64 * 1024)))) {
-                NbtCompound schematic = createSchematic(header.getString("file_name"), bookCount);
+                NbtCompound schematic = createSchematic(archiveName, barrelCount);
                 writeCompoundStart(output, "");
                 for (String key : schematic.getKeys()) {
                     if (!key.equals("Regions")) {
@@ -258,31 +226,35 @@ public final class LitematicaFileCodec {
                 for (String key : region.getKeys()) {
                     writeTag(output, key, region.get(key));
                 }
-                int barrelCount = barrelCountForBooks(bookCount);
                 writeListStart(output, "TileEntities", NbtElement.COMPOUND_TYPE, barrelCount);
-                int bookIndex = 0;
                 for (int barrelIndex = 0; barrelIndex < barrelCount; barrelIndex++) {
                     writeTag(output, "id", NbtString.of(BARREL_ID));
                     NbtCompound position = positionTag(barrelIndex, 0, 0);
                     for (String key : position.getKeys()) {
                         writeTag(output, key, position.get(key));
                     }
-                    int booksInBarrel = Math.min(INVENTORY_SLOTS, bookCount - bookIndex);
-                    writeListStart(output, "Items", NbtElement.COMPOUND_TYPE, booksInBarrel);
-                    for (int slot = 0; slot < booksInBarrel; slot++, bookIndex++) {
-                        long bookSize = Math.min(BYTES_PER_BOOK, fileSize - bookIndex * BYTES_PER_BOOK);
-                        createBook(stream, bookSize, bookIndex, slot, header, digest, format).write(output);
+                    int firstBook = barrelIndex == 0 ? 0 : (barrelIndex - 1) * INVENTORY_SLOTS;
+                    int availableBooks = barrelIndex == 0
+                            ? metadataBookCount
+                            : Math.min(INVENTORY_SLOTS, dataBookCount - firstBook);
+                    writeListStart(output, "Items", NbtElement.COMPOUND_TYPE, availableBooks);
+                    for (int slot = 0; slot < availableBooks; slot++) {
+                        int book = firstBook + slot;
+                        if (barrelIndex == 0) {
+                            writeBook(output, metadataChannel, book * BYTES_PER_BOOK,
+                                    Math.min(BYTES_PER_BOOK, metadataChannel.size() - book * BYTES_PER_BOOK),
+                                    slot, METADATA_TITLE);
+                        } else {
+                            writeBook(output, dataChannel, book * BYTES_PER_BOOK,
+                                    Math.min(BYTES_PER_BOOK, dataChannel.size() - book * BYTES_PER_BOOK),
+                                    slot, DATA_TITLE);
+                        }
                     }
                     output.writeByte(NbtElement.END_TYPE);
                 }
-                // Close FileStorage, Regions and the root; NBT lists have no end marker.
                 output.writeByte(NbtElement.END_TYPE);
                 output.writeByte(NbtElement.END_TYPE);
                 output.writeByte(NbtElement.END_TYPE);
-                if (stream.read() != -1
-                        || !HexFormat.of().formatHex(digest.digest()).equals(header.getString("sha256"))) {
-                    throw new IOException("Input changed while it was being packed");
-                }
             }
             moveWithoutReplacing(temporary, destination);
             moved = true;
@@ -293,45 +265,54 @@ public final class LitematicaFileCodec {
         }
     }
 
-    private static NbtCompound createBook(
-            InputStream stream, long bookSize, int index, int slot,
-            NbtCompound header, MessageDigest digest, String format
+    private static void writeBook(
+            DataOutput output,
+            FileChannel source,
+            long offset,
+            long length,
+            int slot,
+            String title
     ) throws IOException {
+        if (length <= 0 || length > BYTES_PER_BOOK) {
+            throw new IOException("Archive book has an invalid length");
+        }
         NbtList pages = new NbtList();
-        while (bookSize > 0) {
-            int chunkSize = (int) Math.min(bookSize, BYTES_PER_PAGE);
-            byte[] chunk = stream.readNBytes(chunkSize);
-            if (chunk.length != chunkSize) {
-                throw new IOException("Input changed while it was being packed");
-            }
-            digest.update(chunk);
+        long remaining = length;
+        long position = offset;
+        while (remaining > 0) {
+            int chunkSize = (int) Math.min(remaining, BYTES_PER_PAGE);
+            ByteBuffer buffer = ByteBuffer.allocate(chunkSize);
+            source.position(position);
+            readFully(source, buffer);
+            buffer.flip();
+            byte[] chunk = new byte[chunkSize];
+            buffer.get(chunk);
             pages.add(NbtString.of(BASE64_ENCODER.encodeToString(chunk)));
-            bookSize -= chunkSize;
+            position += chunkSize;
+            remaining -= chunkSize;
         }
-        if (pages.isEmpty()) {
-            pages.add(NbtString.of(""));
+        if (pages.isEmpty() || pages.size() > MAX_PAGES_PER_BOOK) {
+            throw new IOException("Archive book page count is invalid");
         }
-
-        NbtCompound marker = new NbtCompound();
-        marker.putString("kind", format);
-        marker.putInt("index", index);
-        if (index == 0) {
-            marker.put("header", header);
-        }
-        NbtCompound itemTag = new NbtCompound();
-        itemTag.putString("author", "CloudArchive");
-        itemTag.putString("title", "Archive " + (index + 1));
-        itemTag.putInt("generation", 0);
-        itemTag.putBoolean("resolved", true);
-        itemTag.put("pages", pages);
-        itemTag.put(MOD_TAG, marker);
-
+        NbtCompound tag = new NbtCompound();
+        tag.putString("author", AUTHOR);
+        tag.putString("title", title);
+        tag.putInt("generation", 0);
+        tag.putBoolean("resolved", true);
+        tag.put("pages", pages);
         NbtCompound stack = new NbtCompound();
         stack.putString("id", BOOK_ID);
         stack.putByte("Count", (byte) 1);
         stack.putByte("Slot", (byte) slot);
-        stack.put("tag", itemTag);
-        return stack;
+        stack.put("tag", tag);
+        writeCompound(output, stack);
+    }
+
+    private static void writeCompound(DataOutput output, NbtCompound value) throws IOException {
+        for (String key : value.getKeys()) {
+            writeTag(output, key, value.get(key));
+        }
+        output.writeByte(NbtElement.END_TYPE);
     }
 
     private static void writeTag(DataOutput output, String name, NbtElement value) throws IOException {
@@ -345,22 +326,105 @@ public final class LitematicaFileCodec {
         output.writeUTF(name);
     }
 
-    private static void writeListStart(
-            DataOutput output, String name, int entryType, int length
-    ) throws IOException {
+    private static void writeListStart(DataOutput output, String name, int entryType, int length)
+            throws IOException {
         output.writeByte(NbtElement.LIST_TYPE);
         output.writeUTF(name);
         output.writeByte(entryType);
         output.writeInt(length);
     }
 
-    private static Path createTemporaryFile(Path destination) throws IOException {
-        Path parent = destination.getParent();
-        if (parent == null) {
-            throw new IOException("Output path has no parent directory");
+    private static void readFully(FileChannel channel, ByteBuffer buffer) throws IOException {
+        while (buffer.hasRemaining()) {
+            int count = channel.read(buffer);
+            if (count < 0) {
+                throw new IOException("Archive staging data is truncated");
+            }
         }
-        Files.createDirectories(parent);
-        return Files.createTempFile(parent, ".cloudarchive-archive-", ".tmp");
+    }
+
+    private static NbtCompound positionTag(int x, int y, int z) {
+        NbtCompound position = new NbtCompound();
+        position.putInt("x", x);
+        position.putInt("y", y);
+        position.putInt("z", z);
+        return position;
+    }
+
+    private static byte[] decodePage(String page) throws IOException {
+        if (page.length() > MAX_PAGE_CHARS) {
+            throw new IOException("Archive page exceeds the supported page capacity");
+        }
+        for (int i = 0; i < page.length(); i++) {
+            char character = page.charAt(i);
+            boolean valid = character >= 'A' && character <= 'Z'
+                    || character >= 'a' && character <= 'z'
+                    || character >= '0' && character <= '9'
+                    || character == '-' || character == '_';
+            if (!valid) {
+                throw new IOException("Archive page contains invalid Base64 data");
+            }
+        }
+        try {
+            byte[] bytes = BASE64_DECODER.decode(page);
+            if (bytes.length == 0 || !BASE64_ENCODER.encodeToString(bytes).equals(page)) {
+                throw new IOException("Archive page contains empty or noncanonical Base64 data");
+            }
+            return bytes;
+        } catch (IllegalArgumentException exception) {
+            throw new IOException("Archive page contains invalid Base64 data", exception);
+        }
+    }
+
+    private static BookPayload readBook(NbtCompound stack, String expectedTitle) throws IOException {
+        if (!stack.getKeys().equals(Set.of("id", "Count", "Slot", "tag"))
+                || !BOOK_ID.equals(stack.getString("id"))
+                || !stack.contains("Count", NbtElement.BYTE_TYPE)
+                || stack.getByte("Count") != 1
+                || !stack.contains("Slot", NbtElement.BYTE_TYPE)
+                || (stack.getByte("Slot") & 0xFF) >= INVENTORY_SLOTS
+                || !stack.contains("tag", NbtElement.COMPOUND_TYPE)) {
+            throw new IOException("Archive book item NBT is invalid");
+        }
+        NbtCompound tag = stack.getCompound("tag");
+        if (!tag.getKeys().equals(Set.of("author", "title", "generation", "resolved", "pages"))
+                || !tag.contains("author", NbtElement.STRING_TYPE)
+                || !tag.contains("title", NbtElement.STRING_TYPE)
+                || !tag.contains("generation", NbtElement.INT_TYPE)
+                || !tag.contains("resolved", NbtElement.BYTE_TYPE)
+                || !tag.contains("pages", NbtElement.LIST_TYPE)
+                || !AUTHOR.equals(tag.getString("author"))
+                || !expectedTitle.equals(tag.getString("title"))
+                || tag.getInt("generation") != 0
+                || !tag.getBoolean("resolved")) {
+            throw new IOException("Archive book uses unsupported or invalid written-book fields");
+        }
+        NbtList pages = tag.getList("pages", NbtElement.STRING_TYPE);
+        if (pages.isEmpty() || pages.size() > MAX_PAGES_PER_BOOK) {
+            throw new IOException("Archive book has an invalid page count");
+        }
+        long size = 0;
+        for (int i = 0; i < pages.size(); i++) {
+            int length = decodePage(pages.getString(i)).length;
+            if (i < pages.size() - 1 && length != BYTES_PER_PAGE) {
+                throw new IOException("Archive book contains an incomplete non-final page");
+            }
+            size += length;
+        }
+        return new BookPayload(stack.getByte("Slot") & 0xFF, pages, size);
+    }
+
+    private static void writePages(FileChannel channel, NbtList pages, long offset) throws IOException {
+        long position = offset;
+        for (int i = 0; i < pages.size(); i++) {
+            byte[] bytes = decodePage(pages.getString(i));
+            ByteBuffer buffer = ByteBuffer.wrap(bytes);
+            channel.position(position);
+            while (buffer.hasRemaining()) {
+                channel.write(buffer);
+            }
+            position += bytes.length;
+        }
     }
 
     private static void moveWithoutReplacing(Path temporary, Path destination) throws IOException {
@@ -381,7 +445,7 @@ public final class LitematicaFileCodec {
 
     static String sha256(Path file) throws IOException {
         MessageDigest digest = newSha256();
-        try (InputStream stream = Files.newInputStream(file)) {
+        try (java.io.InputStream stream = Files.newInputStream(file)) {
             byte[] buffer = new byte[64 * 1024];
             int count;
             while ((count = stream.read(buffer)) != -1) {
@@ -392,106 +456,104 @@ public final class LitematicaFileCodec {
     }
 
     private static final class RestoreState {
-        private final FileChannel channel;
-        private final String expectedFormat;
-        private final Map<Integer, Long> bookSizes = new HashMap<>();
-        private NbtCompound header;
-        private String format;
+        private final FileChannel metadata;
+        private final FileChannel data;
+        private final Map<Integer, Long> metadataBooks = new HashMap<>();
+        private final Map<Integer, Long> dataBooks = new HashMap<>();
 
-        private RestoreState(FileChannel channel, String expectedFormat) {
-            this.channel = channel;
-            this.expectedFormat = expectedFormat;
+        private RestoreState(FileChannel metadata, FileChannel data) {
+            this.metadata = metadata;
+            this.data = data;
         }
 
-        private void acceptBook(NbtCompound stack) throws IOException {
-            NbtCompound tag = stack.getCompound("tag");
-            if (!BOOK_ID.equals(stack.getString("id"))
-                    || !tag.contains(MOD_TAG, NbtElement.COMPOUND_TYPE)) {
-                return;
+        private void acceptBook(ArchiveBookScanner.ArchiveBook archiveBook) throws IOException {
+            if (archiveBook.y() != 0 || archiveBook.z() != 0) {
+                throw new IOException("Archive barrel is outside the supported layout");
             }
-            NbtCompound marker = tag.getCompound(MOD_TAG);
-            String bookFormat = marker.getString("kind");
-            if (!FILE_FORMAT.equals(bookFormat) && !TREE_FORMAT.equals(bookFormat)) {
-                throw new IOException("Archive book uses an unsupported format: " + bookFormat);
+            if (archiveBook.x() < 0) {
+                throw new IOException("Archive barrel has an invalid X coordinate");
             }
-            if (expectedFormat != null && !expectedFormat.equals(bookFormat)) {
-                throw new IOException("Archive type does not match the requested operation");
-            }
-            if (format != null && !format.equals(bookFormat)) {
-                throw new IOException("Archive contains mixed file and tree formats");
-            }
-            format = bookFormat;
-            int index = marker.getInt("index");
-            if (!marker.contains("index", NbtElement.INT_TYPE)
-                    || index < 0 || index == Integer.MAX_VALUE || bookSizes.containsKey(index)) {
-                throw new IOException("Archive contains an invalid or duplicate book index");
-            }
-            if (index == 0) {
-                if (!marker.contains("header", NbtElement.COMPOUND_TYPE)) {
-                    throw new IOException("Archive header is missing");
+            String title = archiveBook.x() == 0 ? METADATA_TITLE : DATA_TITLE;
+            BookPayload payload = readBook(archiveBook.stack(), title);
+            int slot = payload.slot();
+            if (archiveBook.x() == 0) {
+                if (!metadataBooks.containsKey(slot)) {
+                    writePages(metadata, payload.pages(), (long) slot * BYTES_PER_BOOK);
+                    metadataBooks.put(slot, payload.size());
+                } else {
+                    throw new IOException("Archive metadata contains duplicate inventory slots");
                 }
-                header = marker.getCompound("header");
-            } else if (marker.contains("header")) {
-                throw new IOException("Archive contains more than one file header");
-            }
-
-            NbtList pages = tag.getList("pages", NbtElement.STRING_TYPE);
-            if (pages.isEmpty() || pages.size() > MAX_PAGES_PER_BOOK) {
-                throw new IOException("Archive book " + (index + 1) + " has an invalid page count");
-            }
-            // Indices determine file offsets, so world position and inventory order may change.
-            channel.position(index * BYTES_PER_BOOK);
-            long bookSize = 0;
-            for (int pageIndex = 0; pageIndex < pages.size(); pageIndex++) {
-                String page = pages.getString(pageIndex);
-                if (page.length() > MAX_PAGE_CHARS) {
-                    throw new IOException("Archive page exceeds the supported page capacity");
+            } else {
+                long index = ((long) archiveBook.x() - 1) * INVENTORY_SLOTS + slot;
+                if (index > Integer.MAX_VALUE) {
+                    throw new IOException("Archive data book index is too large");
                 }
-                byte[] chunk = decodePage(page);
-                bookSize += chunk.length;
-                ByteBuffer buffer = ByteBuffer.wrap(chunk);
-                while (buffer.hasRemaining()) {
-                    channel.write(buffer);
+                int dataIndex = (int) index;
+                if (!dataBooks.containsKey(dataIndex)) {
+                    writePages(data, payload.pages(), index * BYTES_PER_BOOK);
+                    dataBooks.put(dataIndex, payload.size());
+                } else {
+                    throw new IOException("Archive data contains duplicate book positions");
                 }
             }
-            bookSizes.put(index, bookSize);
         }
 
-        private ArchiveInfo finish() throws IOException {
-            if (bookSizes.isEmpty()) {
-                throw new IOException("No CloudArchive file archive was found in the schematic");
+        private void finish(Path metadataPath, Path dataPath, int barrelCount) throws IOException {
+            if (metadataBooks.isEmpty()) {
+                throw new IOException("Archive metadata barrel is missing");
             }
-            if (header == null) {
-                throw new IOException("Archive header book is missing");
+            TreeArchiveFormat.Manifest manifest = TreeArchiveFormat.read(metadataPath);
+            if (barrelCount != 1 + barrelCountForBooks(manifest.dataBookCount())) {
+                throw new IOException("Archive barrel count does not match metadata");
             }
-            long fileSize = header.getLong("file_size");
-            int bookCount = header.getInt("book_count");
-            String hash = header.getString("sha256");
-            if (!header.contains("file_name", NbtElement.STRING_TYPE)
-                    || !header.contains("file_size", NbtElement.LONG_TYPE)
-                    || !header.contains("book_count", NbtElement.INT_TYPE)
-                    || fileSize < 0 || fileSize > MAX_FILE_SIZE
-                    || bookCount != bookCountForSize(fileSize) || bookCount != bookSizes.size()
-                    || !hash.matches("[0-9a-f]{64}")) {
-                throw new IOException("Archive metadata is invalid or books are missing");
+            int expectedMetadataBooks = TreeArchiveFormat.metadataBookCount(Files.size(metadataPath));
+            if (metadataBooks.size() != expectedMetadataBooks) {
+                throw new IOException("Archive metadata books are missing");
             }
-            for (int index = 0; index < bookCount; index++) {
-                Long size = bookSizes.get(index);
-                long expected = Math.min(BYTES_PER_BOOK, fileSize - index * BYTES_PER_BOOK);
+            long metadataLength = Files.size(metadataPath);
+            for (int index = 0; index < expectedMetadataBooks; index++) {
+                Long size = metadataBooks.get(index);
+                long expected = Math.min(BYTES_PER_BOOK, metadataLength - index * BYTES_PER_BOOK);
                 if (size == null || size != expected) {
-                    throw new IOException("Archive book " + (index + 1) + " is missing or incomplete");
+                    throw new IOException("Archive metadata book is missing or incomplete");
                 }
             }
-            if (channel.size() != fileSize) {
-                throw new IOException("Archive size verification failed");
+            if (dataBooks.size() != manifest.dataBookCount()) {
+                throw new IOException("Archive data books are missing");
             }
-            return new ArchiveInfo(header.getString("file_name"), fileSize, hash, bookCount, format);
+            for (int index = 0; index < manifest.dataBookCount(); index++) {
+                Long size = dataBooks.get(index);
+                long expected = Math.min(BYTES_PER_BOOK,
+                        manifest.dataLength() - index * BYTES_PER_BOOK);
+                if (size == null || size != expected) {
+                    throw new IOException("Archive data book is missing or incomplete");
+                }
+            }
+            if (Files.size(dataPath) != manifest.dataLength()
+                    || !sha256(dataPath).equals(manifest.dataSha256())) {
+                throw new IOException("Archive data size or SHA-256 verification failed");
+            }
         }
     }
 
-    public record ArchiveInfo(String fileName, long fileSize, String sha256, int bookCount, String format) {
-        public int barrelCount() {
-            return barrelCountForBooks(bookCount);
+    private record BookPayload(int slot, NbtList pages, long size) {
+    }
+
+    record DecodedArchive(TreeArchiveFormat.Manifest manifest, ArchiveInfo info) {
+    }
+
+    public record ArchiveInfo(
+            String archiveName,
+            long dataSize,
+            String sha256,
+            int metadataBookCount,
+            int dataBookCount,
+            int barrelCount,
+            TreeArchiveFormat.ArchiveKind kind
+    ) {
+        public int totalBookCount() {
+            return metadataBookCount + dataBookCount;
         }
+
     }
 }
