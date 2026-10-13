@@ -44,6 +44,7 @@ public final class FileCodecSelfTest {
             verifyExtensionsAndStateBoundary(work);
             verifyMultiBarrel(work);
             TreeCodecSelfTest.run(work);
+            CompressionSelfTest.run(work);
             try (Stream<Path> children = Files.list(work)) {
                 require(children.noneMatch(path -> path.getFileName().toString().startsWith(".cloudarchive-")),
                         "Temporary restore directories leaked");
@@ -222,7 +223,7 @@ public final class FileCodecSelfTest {
                 int fileFields = record + 21 + nameLength;
                 switch (scenario) {
                     case 0 -> buffer.putInt(0, 0);
-                    case 1 -> buffer.putShort(4, (short) 2);
+                    case 1 -> buffer.putShort(4, (short) 1);
                     case 2 -> buffer.putShort(6, (short) 1);
                     case 3 -> buffer.put(8, (byte) 2);
                     case 4 -> buffer.put(9, (byte) 1);

@@ -19,5 +19,17 @@ Minecraft, Yarn mappings, Fabric Loader, Fabric API, Fabric Loom, and their
 dependencies are downloaded by Gradle and are not vendored in this repository.
 Their respective licenses and distribution terms apply.
 
+## Zstandard Runtime
+
+The mod JAR embeds `com.github.luben:zstd-jni:1.5.2-5`, including native
+Zstandard libraries. The JNI bindings use the BSD 2-Clause License.
+The bundled Zstandard library is distributed under its BSD 3-Clause License.
+Both notices are reproduced in `licenses/`, also included in the mod JAR.
+
+- JNI project: https://github.com/luben/zstd-jni
+- JNI license: [licenses/zstd-jni.txt](licenses/zstd-jni.txt)
+- Zstandard project: https://github.com/facebook/zstd
+- Zstandard license: [licenses/zstd.txt](licenses/zstd.txt)
+
 Litematica and the Fabric mod template are implementation references; their
 source code is not included in this repository.

@@ -19,6 +19,7 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
+import java.security.DigestOutputStream;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -86,27 +87,18 @@ public final class FileTreeCodec {
         long contentSize = 0;
         List<Node> nodes = new ArrayList<>();
         Map<Path, Long> ids = new HashMap<>();
-        if (kind == ArchiveKind.TREE) {
-            ids.put(root, 0L);
-        }
+        ids.put(root, 0L);
+        Map<String, Extent> duplicateFiles = new HashMap<>();
         long nextId = 1;
         Path work = Files.createTempDirectory(".cloudarchive-tree-");
         try {
             Path metadata = work.resolve("metadata");
             Path data = work.resolve("data");
-            try (FileOutputStream dataOutput = new FileOutputStream(data.toFile())) {
+            MessageDigest dataDigest = LitematicaFileCodec.newSha256();
+            try (OutputStream dataOutput = new DigestOutputStream(
+                    new java.io.BufferedOutputStream(new FileOutputStream(data.toFile())), dataDigest)) {
                 for (Path path : snapshot.paths()) {
                     BasicFileAttributes attributes = snapshot.attributes().get(path);
-                    if (kind == ArchiveKind.FILE) {
-                        TreeArchiveFormat.validateName(path.getFileName().toString());
-                        String hash = snapshot.hashes().get(path);
-                        nodes.add(new Node(nextId++, 0, path.getFileName().toString(), false,
-                                attributes.size(), hash,
-                                attributes.size() == 0 ? List.of() : List.of(new Extent(0, attributes.size()))));
-                        copyVerifiedSource(path, attributes, hash, dataOutput);
-                        contentSize = attributes.size();
-                        break;
-                    }
                     TreeArchiveFormat.validateName(path.getFileName().toString());
                     Long parentId = ids.get(path.getParent());
                     if (parentId == null) {
@@ -115,22 +107,32 @@ public final class FileTreeCodec {
                     boolean directory = attributes.isDirectory();
                     long size = directory ? 0 : attributes.size();
                     String hash = directory ? "" : snapshot.hashes().get(path);
-                    List<Extent> extents = directory || size == 0
-                            ? List.of() : List.of(new Extent(contentSize, size));
+                    String contentKey = hash + ":" + size;
+                    Extent previous = duplicateFiles.get(contentKey);
+                    Extent extent = previous == null ? new Extent(contentSize, size) : previous;
+                    List<Extent> extents = directory || size == 0 ? List.of() : List.of(extent);
                     nodes.add(new Node(nextId, parentId, path.getFileName().toString(),
                             directory, size, hash, extents));
                     ids.put(path, nextId++);
                     if (!directory) {
-                        copyVerifiedSource(path, attributes, hash, dataOutput);
-                        contentSize = TreeArchiveFormat.add(contentSize, size);
+                        copyVerifiedSource(path, attributes, hash,
+                                previous == null ? dataOutput : OutputStream.nullOutputStream());
+                        if (previous == null && size > 0) {
+                            duplicateFiles.put(contentKey, extent);
+                            contentSize = TreeArchiveFormat.add(contentSize, size);
+                        }
                     }
                 }
             }
-            String dataHash = LitematicaFileCodec.sha256(data);
+            String dataHash = HexFormat.of().formatHex(dataDigest.digest());
+            Path stored = work.resolve("stored");
+            DataCompression.Encoded compressed = DataCompression.encode(data, stored);
+            Files.delete(data);
             TreeArchiveFormat.validate(kind, archiveName, nodes, contentSize, nextId);
-            TreeArchiveFormat.write(metadata, kind, archiveName, nodes, contentSize, dataHash, nextId);
+            TreeArchiveFormat.write(metadata, kind, archiveName, nodes, contentSize, dataHash, nextId,
+                    compressed.storedLength(), compressed.blocks());
             LitematicaFileCodec.ArchiveInfo archive = LitematicaFileCodec.packArchive(
-                    metadata, data, destination, kind);
+                    metadata, stored, destination, kind);
             return summary(archive, nodes);
         } finally {
             deleteWorkDirectory(work);
@@ -326,15 +328,14 @@ public final class FileTreeCodec {
 
     private static void rejectLinkedAncestors(Path path) throws IOException {
         for (Path current = path; current != null; current = current.getParent()) {
-            if (Files.isSymbolicLink(current)) {
-                throw new IOException("Symbolic links are not supported: " + current);
-            }
-            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+            try {
                 BasicFileAttributes attributes = Files.readAttributes(current, BasicFileAttributes.class,
                         LinkOption.NOFOLLOW_LINKS);
-                if (attributes.isOther()) {
-                    throw new IOException("Special paths are not supported: " + current);
+                if (attributes.isSymbolicLink() || attributes.isOther()) {
+                    throw new IOException("Links and special paths are not supported: " + current);
                 }
+            } catch (java.nio.file.NoSuchFileException ignored) {
+                // Missing output ancestors will be created only after validation.
             }
         }
     }

@@ -33,7 +33,7 @@ public final class FileCodecCli {
                     }
                     LitematicaFileCodec.ArchiveInfo info =
                             LitematicaFileCodec.pack(Path.of(args[1]), schematic);
-                    printPack(info, 1, 0, schematic);
+                    printPack(info, 1, 0, info.dataSize(), schematic);
                 }
                 case "pack-tree" -> {
                     if (args.length < 3) {
@@ -86,18 +86,20 @@ public final class FileCodecCli {
     }
 
     private static void printTreePack(FileTreeCodec.Summary summary, Path schematic) {
-        printPack(summary.archive(), summary.fileCount(), summary.directoryCount(), schematic);
+        printPack(summary.archive(), summary.fileCount(), summary.directoryCount(), summary.contentSize(), schematic);
     }
 
     private static void printPack(
-            LitematicaFileCodec.ArchiveInfo info, int files, int directories, Path schematic
+            LitematicaFileCodec.ArchiveInfo info, int files, int directories, long contentSize, Path schematic
     ) {
         System.out.printf("Packed %d bytes in %d files and %d directories: %s%n",
-                info.dataSize(), files, directories, schematic.toAbsolutePath());
+                contentSize, files, directories, schematic.toAbsolutePath());
         printLayout(info);
     }
 
     private static void printLayout(LitematicaFileCodec.ArchiveInfo info) {
+        System.out.printf("Unique data: %d bytes; stored data after compression: %d bytes%n",
+                info.dataSize(), info.storedSize());
         System.out.printf("Metadata: %d books in 1 barrel; data: %d books in %d barrels; total: %d barrels%n",
                 info.metadataBookCount(), info.dataBookCount(), info.barrelCount() - 1, info.barrelCount());
     }

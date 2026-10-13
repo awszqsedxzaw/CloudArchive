@@ -24,8 +24,10 @@ import java.util.Set;
 final class TreeArchiveFormat {
     // "CAMD": CloudArchive Metadata.
     static final int MAGIC = 0x43414D44;
-    static final int VERSION = 1;
-    static final int HEADER_BYTES = 88;
+    static final int VERSION = 2;
+    static final int HEADER_BYTES = 100;
+    static final int BLOCK_BYTES = 4 * 1024 * 1024;
+    static final int BLOCK_RECORD_BYTES = 9;
     static final int SHA256_BYTES = 32;
     static final int MAX_NAME_BYTES = 1024;
     static final int MAX_METADATA_BOOKS = LitematicaFileCodec.INVENTORY_SLOTS;
@@ -41,6 +43,10 @@ final class TreeArchiveFormat {
             size = add(size, nodeSize(node));
         }
         return size;
+    }
+
+    static long indexSize(String archiveName, List<Node> nodes, List<Block> blocks) throws IOException {
+        return add(indexSize(archiveName, nodes), (long) BLOCK_RECORD_BYTES * blocks.size());
     }
 
     static int metadataBookCount(long metadataLength) throws IOException {
@@ -69,14 +75,28 @@ final class TreeArchiveFormat {
             String dataSha256,
             long nextId
     ) throws IOException {
+        List<Block> blocks = new ArrayList<>();
+        for (long remaining = dataLength; remaining > 0;) {
+            int size = (int) Math.min(BLOCK_BYTES, remaining);
+            blocks.add(new Block(0, size, size));
+            remaining -= size;
+        }
+        write(metadata, kind, archiveName, nodes, dataLength, dataSha256, nextId, dataLength, blocks);
+    }
+
+    static void write(
+            Path metadata, ArchiveKind kind, String archiveName, List<Node> nodes,
+            long dataLength, String dataSha256, long nextId, long storedLength, List<Block> blocks
+    ) throws IOException {
         byte[] name = utf8Name(archiveName, "archive name");
         byte[] hash = decodeHash(dataSha256);
-        int dataBooks = dataBookCount(dataLength);
-        long indexLength = indexSize(archiveName, nodes);
+        int dataBooks = dataBookCount(storedLength);
+        long indexLength = indexSize(archiveName, nodes, blocks);
         if (metadataBookCount(indexLength) > MAX_METADATA_BOOKS) {
             throw new IOException("Metadata needs more than one barrel");
         }
         validate(kind, archiveName, nodes, dataLength, nextId);
+        validateBlocks(blocks, dataLength, storedLength);
         try (DataOutputStream output = new DataOutputStream(
                 new java.io.BufferedOutputStream(Files.newOutputStream(metadata)))) {
             output.writeInt(MAGIC);
@@ -92,8 +112,15 @@ final class TreeArchiveFormat {
             output.writeInt(dataBooks);
             output.writeInt(name.length);
             output.write(hash);
+            output.writeLong(storedLength);
+            output.writeInt(blocks.size());
             output.write(name);
             writeNodes(output, nodes);
+            for (Block block : blocks) {
+                output.writeByte(block.codec());
+                output.writeInt(block.rawLength());
+                output.writeInt(block.storedLength());
+            }
         }
         if (Files.size(metadata) != indexLength) {
             throw new IOException("Metadata length calculation is inconsistent");
@@ -145,19 +172,23 @@ final class TreeArchiveFormat {
             int dataBookCount = input.readInt();
             int nameLength = input.readInt();
             byte[] dataHash = input.readNBytes(SHA256_BYTES);
+            long storedLength = input.readLong();
+            int blockCount = input.readInt();
             if (generation < 0 || nextId < 1 || count < 0 || nameLength < 1
                     || nameLength > MAX_NAME_BYTES || dataHash.length != SHA256_BYTES
                     || indexLength < HEADER_BYTES + nameLength || indexLength != metadataSize
                     || dataLength < 0 || dataLength > LitematicaFileCodec.MAX_ARCHIVE_BYTES
-                    || dataBookCount != dataBookCount(dataLength)) {
+                    || storedLength < 0 || storedLength > dataLength || blockCount < 0
+                    || dataBookCount != dataBookCount(storedLength)) {
                 throw new IOException("Invalid archive metadata lengths or counts");
             }
             String archiveName = decodeUtf8(input.readNBytes(nameLength), "archive name");
-            if (count > (indexLength - HEADER_BYTES - nameLength) / 22) {
+            long nodeBytes = indexLength - HEADER_BYTES - nameLength - (long) blockCount * BLOCK_RECORD_BYTES;
+            if (nodeBytes < 0 || count > nodeBytes / 22) {
                 throw new IOException("Archive metadata node count is too large");
             }
             LimitedInputStream limited = new LimitedInputStream(
-                    input, indexLength - HEADER_BYTES - nameLength);
+                    input, nodeBytes);
             DataInputStream nodesInput = new DataInputStream(limited);
             List<Node> nodes = new ArrayList<>(Math.min(count, 4096));
             for (int i = 0; i < count; i++) {
@@ -192,10 +223,33 @@ final class TreeArchiveFormat {
             if (limited.remaining() != 0) {
                 throw new IOException("Archive metadata contains trailing or incomplete records");
             }
+            List<Block> blocks = new ArrayList<>(Math.min(blockCount, 4096));
+            for (int i = 0; i < blockCount; i++) {
+                blocks.add(new Block(input.readUnsignedByte(), input.readInt(), input.readInt()));
+            }
+            validateBlocks(blocks, dataLength, storedLength);
             validate(kind, archiveName, nodes, dataLength, nextId);
             return new Manifest(kind, archiveName, dataLength, dataBookCount,
                     encodeHash(dataHash), generation, nextId, List.copyOf(nodes),
-                    paths(nodes));
+                    paths(nodes), storedLength, List.copyOf(blocks));
+        }
+    }
+
+    static void validateBlocks(List<Block> blocks, long dataLength, long storedLength) throws IOException {
+        long raw = 0;
+        long stored = 0;
+        for (Block block : blocks) {
+            if (block.rawLength() < 1 || block.rawLength() > BLOCK_BYTES || block.storedLength() < 1
+                    || block.codec() == 0 && block.storedLength() != block.rawLength()
+                    || block.codec() == 1 && block.storedLength() >= block.rawLength()
+                    || block.codec() != 0 && block.codec() != 1) {
+                throw new IOException("Invalid archive compression block");
+            }
+            raw = add(raw, block.rawLength());
+            stored = add(stored, block.storedLength());
+        }
+        if (raw != dataLength || stored != storedLength) {
+            throw new IOException("Archive compression blocks do not match data lengths");
         }
     }
 
@@ -395,13 +449,17 @@ final class TreeArchiveFormat {
     record Extent(long offset, long length) {
     }
 
+    // Offsets are prefix sums; each block is independently replaceable through new extents.
+    record Block(int codec, int rawLength, int storedLength) {
+    }
+
     record Node(long id, long parentId, String name, boolean directory, long size,
                 String sha256, List<Extent> extents) {
     }
 
     record Manifest(ArchiveKind kind, String archiveName, long dataLength, int dataBookCount,
                     String dataSha256, long generation, long nextId, List<Node> nodes,
-                    Map<Long, Path> paths) {
+                    Map<Long, Path> paths, long storedLength, List<Block> blocks) {
     }
 
     private static final class LimitedInputStream extends InputStream {

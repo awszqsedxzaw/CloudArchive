@@ -113,15 +113,20 @@ final class TreeCodecSelfTest {
         Path metadata = work.resolve("tree-pure-metadata"), data = work.resolve("tree-pure-data");
         LitematicaFileCodec.DecodedArchive decoded = LitematicaFileCodec.restoreTransport(archive, metadata, data);
         require(Files.size(metadata) == TreeArchiveFormat.indexSize(
-                decoded.manifest().archiveName(), decoded.manifest().nodes()), "Metadata contains data bytes");
-        ByteArrayOutputStream expected = new ByteArrayOutputStream();
+                decoded.manifest().archiveName(), decoded.manifest().nodes(), decoded.manifest().blocks()),
+                "Metadata contains data bytes");
+        byte[] raw = Files.readAllBytes(data);
         for (Node node : decoded.manifest().nodes()) {
             if (!node.directory()) {
-                expected.write(Files.readAllBytes(source.resolve(decoded.manifest().paths().get(node.id()))));
+                ByteArrayOutputStream content = new ByteArrayOutputStream();
+                for (Extent extent : node.extents()) {
+                    content.write(raw, (int) extent.offset(), (int) extent.length());
+                }
+                require(java.util.Arrays.equals(content.toByteArray(),
+                        Files.readAllBytes(source.resolve(decoded.manifest().paths().get(node.id())))),
+                        "Data extents contain non-file bytes");
             }
         }
-        require(java.util.Arrays.equals(Files.readAllBytes(data), expected.toByteArray()),
-                "Data stream contains headers or file metadata");
     }
 
     private static void verifyManyFiles(Path work) throws IOException {
@@ -237,7 +242,7 @@ final class TreeCodecSelfTest {
         for (int test = 0; test < 8; test++) {
             byte[] bytes = valid.clone();
             ByteBuffer buffer = ByteBuffer.wrap(bytes);
-            int record = 92;
+            int record = TreeArchiveFormat.HEADER_BYTES + 4;
             switch (test) {
                 case 0 -> buffer.put(record, (byte) 2);
                 case 1 -> buffer.putLong(record + 1, 0);
