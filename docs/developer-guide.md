@@ -42,7 +42,8 @@ X=0 的木桶只存一段 `CAMD v2` 二进制元数据。X>=1 的木桶只存压
 | `TreeArchiveFormat` | `CAMD v2` 头、节点、extent、压缩块表的读写与校验 |
 | `DataCompression` | 4 MiB 块的 Zstandard/RAW 编解码 |
 | `LitematicaFileCodec` | Litematica NBT、木桶、书、页面和投影文件 |
-| `ArchiveScanner` | 单次 NBT 扫描，收集投影结构、区域布局和书库存 |
+| `ArchiveLayoutScanner` | 第一遍 NBT 扫描，确定区域、尺寸和木桶坐标 |
+| `ArchiveBookScanner` | 第二遍 NBT 扫描，提取书库存和书页 |
 | `ParallelGzipOutputStream` | 并行生成并按顺序拼接 gzip 成员 |
 
 ## 2. Litematica 外层格式
@@ -321,23 +322,18 @@ codec = 1: stored_length < raw_length
 
 ## 6. 还原和 `list` 流程
 
-### 6.1 单遍 NBT 扫描
+### 6.1 低内存双遍 NBT 扫描
 
-Litematica NBT 的 compound 字段没有可靠顺序。当前 `ArchiveScanner` 使用一次
-`NbtIo.scanCompressed` 调用把投影解压并收集为内存对象；扫描结束后在同一个对象上验证
-Litematica 版本、唯一 region、区域尺寸和木桶坐标，再按木桶 X 坐标和书槽位提取书籍。
-这样不会为了先确定布局而再次解压 gzip 投影。
-
-读取器不依赖 compound 字段顺序、木桶实体列表顺序或书物品列表顺序，但依赖木桶 X
-坐标和书 `Slot`，因为它们是地址。该实现会保留一次扫描得到的投影 NBT 对象，
-因此读取大投影需要更多堆内存；它不建立第二份大型结构，也不会重复解压。
-当前验证任务堆上限为 512 MiB；开发者处理更大的投影时应按书页总量增加堆内存。
+Litematica NBT 的 compound 字段没有可靠顺序，同时书页总量可能远大于可用堆内存。
+因此读取器采用两遍低内存扫描：第一遍只解析布局并跳过书页；第二遍逐本提取书籍，
+在书结束后立即解码并写入临时文件，不保存整棵 NBT 树。代价是多一次 gzip/NBT 解压，
+但内存需求与当前书大小相关，验证任务可以保持 128 MiB 堆。
 
 ### 6.2 传输数据恢复
 
 书扫描结束后：
 
-1. 按槽位从单次扫描得到的书籍重建元数据文件；
+1. 按槽位从第二遍扫描得到的书籍重建元数据文件；
 2. 读取并严格验证 `CAMD v2`；
 3. 检查元数据书数量、每一本书长度、数据书数量和每一本书长度；
 4. 将数据书重建为 `stored_length` 字节的物理存储文件；
@@ -397,9 +393,9 @@ Litematica 版本、唯一 region、区域尺寸和木桶坐标，再按木桶 X
 实现第三方读取器时，建议遵循以下顺序：
 
 ```text
-读取 gzip NBT（单次扫描）
-    -> 验证 Litematica 版本、唯一 FileStorage 和木桶布局
-    -> 按 X 坐标和槽位重建 metadata/stored 两个字节流
+读取 gzip NBT（低内存双扫描）
+    -> 第一遍验证唯一 FileStorage 和木桶布局
+    -> 第二遍按 X 坐标和槽位重建 metadata/stored 两个字节流
     -> 解析 CAMD v2
     -> 验证 block table
     -> 逐块解压并验证 data_sha256

@@ -104,14 +104,13 @@ public final class LitematicaFileCodec {
                  FileChannel data = FileChannel.open(storedOutput,
                          StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
                 RestoreState state = new RestoreState(metadata, data);
-                ArchiveScanner scanner = new ArchiveScanner(state::acceptBook);
+                ArchiveLayoutScanner.Layout layout = ArchiveLayoutScanner.read(source);
+                ArchiveBookScanner scanner = new ArchiveBookScanner(layout, state::acceptBook);
                 try {
                     net.minecraft.nbt.NbtIo.scanCompressed(source.toFile(), scanner);
                 } catch (java.io.UncheckedIOException exception) {
                     throw exception.getCause();
                 }
-                ArchiveScanner.Layout layout = scanner.finish();
-                scanner.emitBooks(layout);
                 manifest = state.finish(metadataOutput, storedOutput, layout.barrelCount());
             }
             try (java.io.OutputStream output = new BufferedOutputStream(Files.newOutputStream(dataOutput,
@@ -462,7 +461,7 @@ public final class LitematicaFileCodec {
             this.data = data;
         }
 
-        private void acceptBook(ArchiveScanner.ArchiveBook archiveBook) throws IOException {
+        private void acceptBook(ArchiveBookScanner.ArchiveBook archiveBook) throws IOException {
             if (archiveBook.y() != 0 || archiveBook.z() != 0) {
                 throw new IOException("Archive barrel is outside the supported layout");
             }

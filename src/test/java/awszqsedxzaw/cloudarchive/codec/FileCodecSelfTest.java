@@ -372,7 +372,8 @@ public final class FileCodecSelfTest {
                 && info.totalBookCount() == 29 && info.barrelCount() == 3, "Multi-barrel counts differ");
         AtomicInteger metadataBooks = new AtomicInteger();
         AtomicInteger dataBooks = new AtomicInteger();
-        ArchiveScanner scanner = new ArchiveScanner(book -> {
+        ArchiveLayoutScanner.Layout layout = ArchiveLayoutScanner.read(archive);
+        ArchiveBookScanner scanner = new ArchiveBookScanner(layout, book -> {
             verifyBook(book.stack(), book.x() == 0);
             if (book.x() == 0) {
                 metadataBooks.incrementAndGet();
@@ -383,7 +384,7 @@ public final class FileCodecSelfTest {
                         "Multi-barrel page count differs");
             }
         });
-        ArchiveScanner.Layout layout = scanArchive(archive, scanner);
+        NbtIo.scanCompressed(archive.toFile(), scanner);
         require(layout.barrelCount() == 3, "Multi-barrel layout differs");
         require(metadataBooks.get() == 1 && dataBooks.get() == 28, "Streaming scan lost books");
         Path restored = work.resolve("multi-barrel.restored");
@@ -391,13 +392,6 @@ public final class FileCodecSelfTest {
         require(Files.mismatch(input, restored) == -1, "Multi-barrel bytes differ");
         System.out.printf("Multi-barrel round trip passed: %d bytes, 1 metadata book, 28 data books, 3 barrels%n",
                 size);
-    }
-
-    private static ArchiveScanner.Layout scanArchive(Path archive, ArchiveScanner scanner) throws IOException {
-        NbtIo.scanCompressed(archive.toFile(), scanner);
-        ArchiveScanner.Layout layout = scanner.finish();
-        scanner.emitBooks(layout);
-        return layout;
     }
 
     static void mutateAndReject(Path work, String name, NbtCompound original, Consumer<NbtCompound> mutation)
