@@ -96,7 +96,6 @@ public final class LitematicaFileCodec {
         if (!Files.isRegularFile(source)) {
             throw new IOException("Schematic is not a regular file: " + source);
         }
-        ArchiveLayoutScanner.Layout layout = ArchiveLayoutScanner.read(source);
         Path storedOutput = Files.createTempFile(dataOutput.toAbsolutePath().getParent(), ".cloudarchive-data-", ".tmp");
         try {
             TreeArchiveFormat.Manifest manifest;
@@ -105,19 +104,14 @@ public final class LitematicaFileCodec {
                  FileChannel data = FileChannel.open(storedOutput,
                          StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
                 RestoreState state = new RestoreState(metadata, data);
-                ArchiveBookScanner scanner = new ArchiveBookScanner(layout, state::acceptBook);
+                ArchiveScanner scanner = new ArchiveScanner(state::acceptBook);
                 try {
                     net.minecraft.nbt.NbtIo.scanCompressed(source.toFile(), scanner);
                 } catch (java.io.UncheckedIOException exception) {
                     throw exception.getCause();
                 }
-                NbtElement rootElement = scanner.getRoot();
-                if (!(rootElement instanceof NbtCompound root)
-                        || !root.contains("Version", NbtElement.INT_TYPE)
-                        || root.getInt("Version") != 6
-                        || !root.contains("Regions", NbtElement.COMPOUND_TYPE)) {
-                    throw new IOException("Input is not a supported 1.20.1 Litematica schematic");
-                }
+                ArchiveScanner.Layout layout = scanner.finish();
+                scanner.emitBooks(layout);
                 manifest = state.finish(metadataOutput, storedOutput, layout.barrelCount());
             }
             try (java.io.OutputStream output = new BufferedOutputStream(Files.newOutputStream(dataOutput,
@@ -468,7 +462,7 @@ public final class LitematicaFileCodec {
             this.data = data;
         }
 
-        private void acceptBook(ArchiveBookScanner.ArchiveBook archiveBook) throws IOException {
+        private void acceptBook(ArchiveScanner.ArchiveBook archiveBook) throws IOException {
             if (archiveBook.y() != 0 || archiveBook.z() != 0) {
                 throw new IOException("Archive barrel is outside the supported layout");
             }

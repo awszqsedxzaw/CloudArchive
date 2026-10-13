@@ -2,28 +2,24 @@ package awszqsedxzaw.cloudarchive.codec;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.Set;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
-import net.minecraft.nbt.NbtInt;
-import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtList;
-import net.minecraft.nbt.NbtString;
 import net.minecraft.nbt.NbtType;
 import net.minecraft.nbt.scanner.NbtCollector;
 
-// Read coordinates without inventories first: compound fields have no defined order.
-final class ArchiveLayoutScanner extends NbtCollector {
-    static Layout read(Path source) throws IOException {
-        ArchiveLayoutScanner scanner = new ArchiveLayoutScanner();
-        try {
-            NbtIo.scanCompressed(source.toFile(), scanner);
-        } catch (UncheckedIOException exception) {
-            throw exception.getCause();
-        }
-        if (!(scanner.getRoot() instanceof NbtCompound root)
+// Collects the projection once; layout and books are validated from the same NBT tree.
+final class ArchiveScanner extends NbtCollector {
+    private final BookConsumer consumer;
+
+    ArchiveScanner(BookConsumer consumer) {
+        this.consumer = consumer;
+    }
+
+    Layout finish() throws IOException {
+        if (!(getRoot() instanceof NbtCompound root)
                 || root.getInt("Version") != 6 || root.getInt("SubVersion") != 1
                 || root.getInt("MinecraftDataVersion") != 3465
                 || !root.contains("Regions", NbtElement.COMPOUND_TYPE)) {
@@ -33,8 +29,8 @@ final class ArchiveLayoutScanner extends NbtCollector {
         if (regions.getKeys().size() != 1) {
             throw new IOException("Archive must occupy one region");
         }
-        String name = regions.getKeys().iterator().next();
-        NbtCompound region = regions.getCompound(name);
+        String regionName = regions.getKeys().iterator().next();
+        NbtCompound region = regions.getCompound(regionName);
         NbtCompound size = region.getCompound("Size");
         int barrels = size.getInt("x");
         if (barrels < 1 || size.getInt("y") != 1 || size.getInt("z") != 1) {
@@ -59,7 +55,24 @@ final class ArchiveLayoutScanner extends NbtCollector {
             }
             positions[i] = x;
         }
-        return new Layout(name, positions);
+        return new Layout(regionName, positions);
+    }
+
+    void emitBooks(Layout layout) throws IOException {
+        NbtCompound root = (NbtCompound) getRoot();
+        NbtList entities = root.getCompound("Regions").getCompound(layout.region())
+                .getList("TileEntities", NbtElement.COMPOUND_TYPE);
+        for (int i = 0; i < entities.size(); i++) {
+            NbtCompound entity = entities.getCompound(i);
+            int x = entity.getInt("x");
+            NbtList items = entity.getList("Items", NbtElement.COMPOUND_TYPE);
+            if (items.size() > LitematicaFileCodec.INVENTORY_SLOTS) {
+                throw new IOException("Invalid archive inventory list");
+            }
+            for (int j = 0; j < items.size(); j++) {
+                consumer.accept(new ArchiveBook(x, 0, 0, items.getCompound(j)));
+            }
+        }
     }
 
     @Override
@@ -70,28 +83,12 @@ final class ArchiveLayoutScanner extends NbtCollector {
         return super.start(type);
     }
 
-    @Override
-    public NestedResult startSubNbt(NbtType<?> type, String key) {
-        boolean include = switch (getDepth()) {
-            case 1 -> Set.of("Version", "SubVersion", "MinecraftDataVersion").contains(key)
-                    && type == NbtInt.TYPE || key.equals("Regions") && type == NbtCompound.TYPE;
-            case 2 -> type == NbtCompound.TYPE;
-            case 3 -> key.equals("Size") && type == NbtCompound.TYPE
-                    || key.equals("TileEntities") && type == NbtList.TYPE;
-            case 4 -> Set.of("x", "y", "z").contains(key) && type == NbtInt.TYPE;
-            case 5 -> Set.of("x", "y", "z").contains(key) && type == NbtInt.TYPE
-                    || key.equals("id") && type == NbtString.TYPE;
-            default -> false;
-        };
-        return include ? super.startSubNbt(type, key) : NestedResult.SKIP;
+    @FunctionalInterface
+    interface BookConsumer {
+        void accept(ArchiveBook book) throws IOException;
     }
 
-    @Override
-    public Result visitListMeta(NbtType<?> type, int length) {
-        if (length < 1 || type != NbtCompound.TYPE) {
-            throw new UncheckedIOException(new IOException("Invalid archive barrel list"));
-        }
-        return super.visitListMeta(type, length);
+    record ArchiveBook(int x, int y, int z, NbtCompound stack) {
     }
 
     record Layout(String region, int[] positions) {

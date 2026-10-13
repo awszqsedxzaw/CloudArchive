@@ -42,8 +42,7 @@ X=0 的木桶只存一段 `CAMD v2` 二进制元数据。X>=1 的木桶只存压
 | `TreeArchiveFormat` | `CAMD v2` 头、节点、extent、压缩块表的读写与校验 |
 | `DataCompression` | 4 MiB 块的 Zstandard/RAW 编解码 |
 | `LitematicaFileCodec` | Litematica NBT、木桶、书、页面和投影文件 |
-| `ArchiveLayoutScanner` | 第一遍 NBT 扫描，确定区域、尺寸和木桶坐标 |
-| `ArchiveBookScanner` | 第二遍 NBT 扫描，提取书库存和书页 |
+| `ArchiveScanner` | 单次 NBT 扫描，收集投影结构、区域布局和书库存 |
 | `ParallelGzipOutputStream` | 并行生成并按顺序拼接 gzip 成员 |
 
 ## 2. Litematica 外层格式
@@ -295,14 +294,13 @@ codec = 1: stored_length < raw_length
 `LitematicaFileCodec.pack` 委托给 `FileTreeCodec.packSingleFile`：
 
 1. 拒绝符号链接、特殊文件和链接祖先；
-2. 读取文件属性并计算 SHA-256；
-3. 再次检查文件大小、修改时间和 file key；
-4. 建立单文件快照，根节点 parent_id=0；
-5. 将文件复制到临时逻辑数据文件，同时再次计算哈希；
-6. 如果源文件在复制过程中改变，立即失败；
-7. 对逻辑数据做 4 MiB 分块压缩；
-8. 写 `CAMD v2` 元数据和块表；
-9. 生成木桶 NBT 并原子移动到目标 `.litematic`。
+2. 读取文件属性；
+3. 建立单文件快照，根节点 parent_id=0；
+4. 在一次顺序读取中把源文件复制到临时 staging 文件并计算 SHA-256；
+5. 检查复制前后的文件属性，发现大小、修改时间或 file key 变化时失败；
+6. 对 staging 中的逻辑数据做 4 MiB 分块压缩；
+7. 写 `CAMD v2` 元数据和块表；
+8. 生成木桶 NBT 并原子移动到目标 `.litematic`。
 
 ### 5.2 文件树
 
@@ -313,43 +311,33 @@ codec = 1: stored_length < raw_length
 1. 拒绝绝对选择路径和逃出根目录的 `..`；
 2. 递归发现目录与普通文件；
 3. 按根相对路径排序；
-4. 保存每个节点的属性；
-5. 对每个文件计算 SHA-256，并检查源文件仍未改变。
+4. 保存每个节点的属性。
 
-写入阶段使用 `hash + size` 作为重复文件候选键。命中时不再复制文件内容，而是复用原文件 extent；未命中时才追加到逻辑数据流。所有文件仍保留独立节点和独立文件哈希。
+写入阶段对每个文件只顺序读取一次：同时写入临时 staging 文件并计算 SHA-256，
+然后使用 `hash + size` 作为重复文件候选键。首次出现的内容从 staging 追加到逻辑数据流；
+重复文件不再读取源文件，只复用首次内容的 extent。所有文件仍保留独立节点和独立文件哈希。
 
 完成逻辑数据后，整体 SHA-256 是写入逻辑数据流时计算的摘要。它覆盖去重后的唯一数据，不重复计算相同文件。
 
 ## 6. 还原和 `list` 流程
 
-### 6.1 两遍 NBT 扫描
+### 6.1 单遍 NBT 扫描
 
-Litematica NBT 的 compound 字段没有可靠顺序，读取器因此分两遍扫描：
+Litematica NBT 的 compound 字段没有可靠顺序。当前 `ArchiveScanner` 使用一次
+`NbtIo.scanCompressed` 调用把投影解压并收集为内存对象；扫描结束后在同一个对象上验证
+Litematica 版本、唯一 region、区域尺寸和木桶坐标，再按木桶 X 坐标和书槽位提取书籍。
+这样不会为了先确定布局而再次解压 gzip 投影。
 
-**第一遍 `ArchiveLayoutScanner`**
-
-* 验证 gzip/NBT 根结构；
-* 验证 `Version`、`SubVersion`、`MinecraftDataVersion`；
-* 找到唯一 region；
-* 验证 region 尺寸；
-* 收集每个 TileEntity 的 X 坐标；
-* 验证木桶坐标连续、唯一、y/z 为 0。
-
-**第二遍 `ArchiveBookScanner`**
-
-* 根据第一遍得到的 region 名称和木桶布局定位 `TileEntities`；
-* 定位每个木桶的 `Items`；
-* 对每个书物品检查原生字段集合；
-* 将页面解码并写入临时元数据/存储文件；
-* 按 `(barrelX, Slot)` 计算数据书索引。
-
-读取器不依赖 compound 字段顺序、木桶实体列表顺序或书物品列表顺序，但依赖木桶 X 坐标和书 `Slot`，因为它们是地址。
+读取器不依赖 compound 字段顺序、木桶实体列表顺序或书物品列表顺序，但依赖木桶 X
+坐标和书 `Slot`，因为它们是地址。该实现会保留一次扫描得到的投影 NBT 对象，
+因此读取大投影需要更多堆内存；它不建立第二份大型结构，也不会重复解压。
+当前验证任务堆上限为 512 MiB；开发者处理更大的投影时应按书页总量增加堆内存。
 
 ### 6.2 传输数据恢复
 
 书扫描结束后：
 
-1. 按槽位重建元数据文件；
+1. 按槽位从单次扫描得到的书籍重建元数据文件；
 2. 读取并严格验证 `CAMD v2`；
 3. 检查元数据书数量、每一本书长度、数据书数量和每一本书长度；
 4. 将数据书重建为 `stored_length` 字节的物理存储文件；
@@ -409,10 +397,9 @@ Litematica NBT 的 compound 字段没有可靠顺序，读取器因此分两遍�
 实现第三方读取器时，建议遵循以下顺序：
 
 ```text
-读取 gzip NBT
-    -> 验证 Litematica 版本和唯一 FileStorage
-    -> 按 X 坐标建立木桶地址表
-    -> 按槽位重建 metadata/stored 两个字节流
+读取 gzip NBT（单次扫描）
+    -> 验证 Litematica 版本、唯一 FileStorage 和木桶布局
+    -> 按 X 坐标和槽位重建 metadata/stored 两个字节流
     -> 解析 CAMD v2
     -> 验证 block table
     -> 逐块解压并验证 data_sha256

@@ -70,9 +70,8 @@ public final class FileTreeCodec {
         }
         rejectLinkedAncestors(destination.getParent());
         BasicFileAttributes attributes = readSourceAttributes(source);
-        String hash = LitematicaFileCodec.sha256(source);
         requireUnchanged(source, attributes);
-        Snapshot snapshot = new Snapshot(List.of(source), Map.of(source, attributes), Map.of(source, hash));
+        Snapshot snapshot = new Snapshot(List.of(source), Map.of(source, attributes), Map.of());
         return packSnapshot(source.getParent(), snapshot, destination, ArchiveKind.FILE,
                 source.getFileName().toString());
     }
@@ -106,22 +105,30 @@ public final class FileTreeCodec {
                     }
                     boolean directory = attributes.isDirectory();
                     long size = directory ? 0 : attributes.size();
-                    String hash = directory ? "" : snapshot.hashes().get(path);
-                    String contentKey = hash + ":" + size;
-                    Extent previous = duplicateFiles.get(contentKey);
-                    Extent extent = previous == null ? new Extent(contentSize, size) : previous;
-                    List<Extent> extents = directory || size == 0 ? List.of() : List.of(extent);
+                    String hash = "";
+                    List<Extent> extents = List.of();
+                    if (!directory) {
+                        Path staged = work.resolve("source-" + nextId);
+                        hash = copyAndHashSource(path, attributes, staged);
+                        if (size > 0) {
+                            String contentKey = hash + ":" + size;
+                            Extent previous = duplicateFiles.get(contentKey);
+                            if (previous == null) {
+                                extents = List.of(new Extent(contentSize, size));
+                                duplicateFiles.put(contentKey, extents.get(0));
+                                try (InputStream input = Files.newInputStream(staged)) {
+                                    input.transferTo(dataOutput);
+                                }
+                                contentSize = TreeArchiveFormat.add(contentSize, size);
+                            } else {
+                                extents = List.of(previous);
+                            }
+                        }
+                        Files.delete(staged);
+                    }
                     nodes.add(new Node(nextId, parentId, path.getFileName().toString(),
                             directory, size, hash, extents));
                     ids.put(path, nextId++);
-                    if (!directory) {
-                        copyVerifiedSource(path, attributes, hash,
-                                previous == null ? dataOutput : OutputStream.nullOutputStream());
-                        if (previous == null && size > 0) {
-                            duplicateFiles.put(contentKey, extent);
-                            contentSize = TreeArchiveFormat.add(contentSize, size);
-                        }
-                    }
                 }
             }
             String dataHash = HexFormat.of().formatHex(dataDigest.digest());
@@ -264,31 +271,22 @@ public final class FileTreeCodec {
             });
         }
         Map<Path, BasicFileAttributes> attributes = new HashMap<>();
-        Map<Path, String> hashes = new HashMap<>();
         for (Path path : paths) {
             rejectLinkedAncestors(path);
             BasicFileAttributes before = readSourceAttributes(path);
             attributes.put(path, before);
-            if (before.isRegularFile()) {
-                hashes.put(path, LitematicaFileCodec.sha256(path));
-                requireUnchanged(path, before);
-            }
         }
-        return new Snapshot(List.copyOf(paths), attributes, hashes);
+        return new Snapshot(List.copyOf(paths), attributes, Map.of());
     }
 
-    static void copyVerifiedSource(
-            Path source, BasicFileAttributes expected, String expectedHash, OutputStream output
+    private static String copyAndHashSource(
+            Path source, BasicFileAttributes expected, Path staged
     ) throws IOException {
         requireUnchanged(source, expected);
-        MessageDigest digest;
-        try {
-            digest = MessageDigest.getInstance("SHA-256");
-        } catch (NoSuchAlgorithmException exception) {
-            throw new IllegalStateException(exception);
-        }
+        MessageDigest digest = LitematicaFileCodec.newSha256();
         long size = 0;
-        try (InputStream input = Files.newInputStream(source)) {
+        try (InputStream input = Files.newInputStream(source);
+             OutputStream output = Files.newOutputStream(staged)) {
             byte[] buffer = new byte[64 * 1024];
             int count;
             while ((count = input.read(buffer)) != -1) {
@@ -301,9 +299,10 @@ public final class FileTreeCodec {
             }
         }
         requireUnchanged(source, expected);
-        if (size != expected.size() || !HexFormat.of().formatHex(digest.digest()).equals(expectedHash)) {
+        if (size != expected.size()) {
             throw new IOException("Source changed while packing: " + source);
         }
+        return HexFormat.of().formatHex(digest.digest());
     }
 
     private static BasicFileAttributes readSourceAttributes(Path path) throws IOException {

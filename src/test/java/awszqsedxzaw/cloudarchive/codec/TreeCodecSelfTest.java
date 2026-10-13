@@ -278,11 +278,10 @@ final class TreeCodecSelfTest {
         Path changing = work.resolve("changing.bin");
         Files.write(changing, new byte[]{1, 2, 3});
         BasicFileAttributes attributes = Files.readAttributes(changing, BasicFileAttributes.class);
-        String hash = LitematicaFileCodec.sha256(changing);
         Files.write(changing, new byte[]{3, 2, 1});
         Files.setLastModifiedTime(changing, attributes.lastModifiedTime());
-        expectFailure(() -> FileTreeCodec.copyVerifiedSource(changing, attributes, hash,
-                new ByteArrayOutputStream()), "Same-size source modification not detected");
+        expectFailure(() -> FileTreeCodec.pack(changing.getParent(), List.of(changing.getFileName()),
+                work.resolve("changed.litematic")), "Same-size source modification not detected");
         Path linkRoot = Files.createDirectory(work.resolve("link-root"));
         try {
             Files.createSymbolicLink(linkRoot.resolve("link"), changing);
