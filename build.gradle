@@ -92,7 +92,7 @@ tasks.register('benchmarkFileCodec', JavaExec) {
     dependsOn tasks.named('testClasses')
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'awszqsedxzaw.cloudarchive.codec.CodecBenchmark'
-    maxHeapSize = '128m'
+    maxHeapSize = '512m'
 }
 
 tasks.register('benchmarkPageEncoding', JavaExec) {
