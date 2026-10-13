@@ -10,6 +10,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
@@ -39,7 +40,8 @@ public final class LitematicaFileCodec {
     private static final long MAX_FILE_SIZE = BYTES_PER_BOOK * Integer.MAX_VALUE;
     private static final String BOOK_ID = "minecraft:written_book";
     private static final String BARREL_ID = "minecraft:barrel";
-    private static final String FORMAT_KIND = "file-archive-v2";
+    static final String FILE_FORMAT = "file-archive-v2";
+    static final String TREE_FORMAT = "tree-archive-v1";
     private static final Base64.Encoder BASE64_ENCODER = Base64.getUrlEncoder().withoutPadding();
     private static final Base64.Decoder BASE64_DECODER = Base64.getUrlDecoder();
 
@@ -47,19 +49,26 @@ public final class LitematicaFileCodec {
     }
 
     public static ArchiveInfo pack(Path input, Path output) throws IOException {
+        return packPayload(input, output, input.toAbsolutePath().getFileName().toString(), FILE_FORMAT);
+    }
+
+    static ArchiveInfo packPayload(Path input, Path output, String name, String format) throws IOException {
+        if (!FILE_FORMAT.equals(format) && !TREE_FORMAT.equals(format)) {
+            throw new IOException("Unsupported archive format: " + format);
+        }
         Path source = input.toAbsolutePath().normalize();
         Path destination = normalizeSchematicPath(output).toAbsolutePath().normalize();
 
         if (!Files.isRegularFile(source)) {
             throw new IOException("Input is not a regular file: " + source);
         }
-        if (Files.exists(destination)) {
+        if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS)) {
             throw new FileAlreadyExistsException(destination.toString());
         }
 
         long fileSize = Files.size(source);
         int bookCount = bookCountForSize(fileSize);
-        String fileName = source.getFileName().toString();
+        String fileName = name;
         // Hash first so only the first book needs the complete file header.
         String sha256 = sha256(source);
         NbtCompound header = new NbtCompound();
@@ -68,8 +77,8 @@ public final class LitematicaFileCodec {
         header.putString("sha256", sha256);
         header.putInt("book_count", bookCount);
 
-        writeCompressedAtomically(source, destination, fileSize, bookCount, header);
-        return new ArchiveInfo(fileName, fileSize, sha256, bookCount);
+        writeCompressedAtomically(source, destination, fileSize, bookCount, header, format);
+        return new ArchiveInfo(fileName, fileSize, sha256, bookCount, format);
     }
 
     static int bookCountForSize(long fileSize) throws IOException {
@@ -101,12 +110,16 @@ public final class LitematicaFileCodec {
     }
 
     public static ArchiveInfo restore(Path input, Path output) throws IOException {
+        return restorePayload(input, output, FILE_FORMAT);
+    }
+
+    static ArchiveInfo restorePayload(Path input, Path output, String expectedFormat) throws IOException {
         Path source = input.toAbsolutePath().normalize();
         Path destination = output.toAbsolutePath().normalize();
         if (!Files.isRegularFile(source)) {
             throw new IOException("Schematic is not a regular file: " + source);
         }
-        if (Files.exists(destination)) {
+        if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS)) {
             throw new FileAlreadyExistsException(destination.toString());
         }
 
@@ -115,7 +128,7 @@ public final class LitematicaFileCodec {
         try {
             ArchiveInfo info;
             try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.WRITE)) {
-                RestoreState state = new RestoreState(channel);
+                RestoreState state = new RestoreState(channel, expectedFormat);
                 ArchiveBookScanner scanner = new ArchiveBookScanner(state::acceptBook);
                 try {
                     NbtIo.scanCompressed(source.toFile(), scanner);
@@ -223,7 +236,7 @@ public final class LitematicaFileCodec {
     }
 
     private static void writeCompressedAtomically(
-            Path source, Path destination, long fileSize, int bookCount, NbtCompound header
+            Path source, Path destination, long fileSize, int bookCount, NbtCompound header, String format
     ) throws IOException {
         Path temporary = createTemporaryFile(destination);
         boolean moved = false;
@@ -258,7 +271,7 @@ public final class LitematicaFileCodec {
                     writeListStart(output, "Items", NbtElement.COMPOUND_TYPE, booksInBarrel);
                     for (int slot = 0; slot < booksInBarrel; slot++, bookIndex++) {
                         long bookSize = Math.min(BYTES_PER_BOOK, fileSize - bookIndex * BYTES_PER_BOOK);
-                        createBook(stream, bookSize, bookIndex, slot, header, digest).write(output);
+                        createBook(stream, bookSize, bookIndex, slot, header, digest, format).write(output);
                     }
                     output.writeByte(NbtElement.END_TYPE);
                 }
@@ -282,7 +295,7 @@ public final class LitematicaFileCodec {
 
     private static NbtCompound createBook(
             InputStream stream, long bookSize, int index, int slot,
-            NbtCompound header, MessageDigest digest
+            NbtCompound header, MessageDigest digest, String format
     ) throws IOException {
         NbtList pages = new NbtList();
         while (bookSize > 0) {
@@ -300,7 +313,7 @@ public final class LitematicaFileCodec {
         }
 
         NbtCompound marker = new NbtCompound();
-        marker.putString("kind", FORMAT_KIND);
+        marker.putString("kind", format);
         marker.putInt("index", index);
         if (index == 0) {
             marker.put("header", header);
@@ -366,7 +379,7 @@ public final class LitematicaFileCodec {
         }
     }
 
-    private static String sha256(Path file) throws IOException {
+    static String sha256(Path file) throws IOException {
         MessageDigest digest = newSha256();
         try (InputStream stream = Files.newInputStream(file)) {
             byte[] buffer = new byte[64 * 1024];
@@ -380,11 +393,14 @@ public final class LitematicaFileCodec {
 
     private static final class RestoreState {
         private final FileChannel channel;
+        private final String expectedFormat;
         private final Map<Integer, Long> bookSizes = new HashMap<>();
         private NbtCompound header;
+        private String format;
 
-        private RestoreState(FileChannel channel) {
+        private RestoreState(FileChannel channel, String expectedFormat) {
             this.channel = channel;
+            this.expectedFormat = expectedFormat;
         }
 
         private void acceptBook(NbtCompound stack) throws IOException {
@@ -394,9 +410,17 @@ public final class LitematicaFileCodec {
                 return;
             }
             NbtCompound marker = tag.getCompound(MOD_TAG);
-            if (!FORMAT_KIND.equals(marker.getString("kind"))) {
-                throw new IOException("Archive book uses an unsupported format: " + marker.getString("kind"));
+            String bookFormat = marker.getString("kind");
+            if (!FILE_FORMAT.equals(bookFormat) && !TREE_FORMAT.equals(bookFormat)) {
+                throw new IOException("Archive book uses an unsupported format: " + bookFormat);
             }
+            if (expectedFormat != null && !expectedFormat.equals(bookFormat)) {
+                throw new IOException("Archive type does not match the requested operation");
+            }
+            if (format != null && !format.equals(bookFormat)) {
+                throw new IOException("Archive contains mixed file and tree formats");
+            }
+            format = bookFormat;
             int index = marker.getInt("index");
             if (!marker.contains("index", NbtElement.INT_TYPE)
                     || index < 0 || index == Integer.MAX_VALUE || bookSizes.containsKey(index)) {
@@ -461,11 +485,11 @@ public final class LitematicaFileCodec {
             if (channel.size() != fileSize) {
                 throw new IOException("Archive size verification failed");
             }
-            return new ArchiveInfo(header.getString("file_name"), fileSize, hash, bookCount);
+            return new ArchiveInfo(header.getString("file_name"), fileSize, hash, bookCount, format);
         }
     }
 
-    public record ArchiveInfo(String fileName, long fileSize, String sha256, int bookCount) {
+    public record ArchiveInfo(String fileName, long fileSize, String sha256, int bookCount, String format) {
         public int barrelCount() {
             return barrelCountForBooks(bookCount);
         }

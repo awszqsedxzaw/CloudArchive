@@ -12,3 +12,4 @@ AGENTS.md
 *.litematic
 *.litematica
 .cloudarchive-archive-*.tmp
+.cloudarchive-tree-*/

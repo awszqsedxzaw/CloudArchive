@@ -47,6 +47,7 @@ public final class FileCodecSelfTest {
             verifyLegacyExtensionNormalization(directory);
             verifyIntegrityAndNoOverwrite(directory);
             verifyMultiBarrelRoundTrip(directory);
+            TreeCodecSelfTest.run(directory);
             System.out.println("File codec checks passed");
         } finally {
             deleteTree(directory);

@@ -1,7 +1,10 @@
 package awszqsedxzaw.cloudarchive.codec;
 
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.util.Arrays;
 
 public final class FileCodecCli {
     private FileCodecCli() {
@@ -14,7 +17,7 @@ public final class FileCodecCli {
                 return;
             }
 
-            if (args.length != 3) {
+            if (args.length == 0) {
                 printUsage();
                 System.exit(2);
                 return;
@@ -22,7 +25,12 @@ public final class FileCodecCli {
 
             switch (args[0]) {
                 case "pack" -> {
+                    requireArguments(args, 3);
                     Path schematic = LitematicaFileCodec.normalizeSchematicPath(Path.of(args[2]));
+                    if (Files.isDirectory(Path.of(args[1]), LinkOption.NOFOLLOW_LINKS)) {
+                        printTreePack(FileTreeCodec.pack(Path.of(args[1]), schematic), schematic);
+                        break;
+                    }
                     LitematicaFileCodec.ArchiveInfo info =
                             LitematicaFileCodec.pack(Path.of(args[1]), schematic);
                     System.out.printf(
@@ -30,13 +38,34 @@ public final class FileCodecCli {
                             info.fileSize(), info.bookCount(), info.barrelCount(), schematic.toAbsolutePath()
                     );
                 }
+                case "pack-tree" -> {
+                    if (args.length < 3) {
+                        throw new IllegalArgumentException("pack-tree requires a root and output path");
+                    }
+                    Path schematic = LitematicaFileCodec.normalizeSchematicPath(Path.of(args[2]));
+                    printTreePack(FileTreeCodec.pack(Path.of(args[1]),
+                            Arrays.stream(args).skip(3).map(Path::of).toList(), schematic), schematic);
+                }
                 case "restore" -> {
-                    LitematicaFileCodec.ArchiveInfo info =
-                            LitematicaFileCodec.restore(Path.of(args[1]), Path.of(args[2]));
+                    requireArguments(args, 3);
+                    FileTreeCodec.Summary summary = FileTreeCodec.restore(Path.of(args[1]), Path.of(args[2]));
+                    LitematicaFileCodec.ArchiveInfo info = summary.archive();
                     System.out.printf(
-                            "Restored %d bytes from %d books (%s): %s%n",
-                            info.fileSize(), info.bookCount(), info.fileName(), Path.of(args[2]).toAbsolutePath()
+                            "Restored %d bytes in %d files and %d directories from %d books: %s%n",
+                            summary.contentSize(), summary.fileCount(), summary.directoryCount(),
+                            info.bookCount(), Path.of(args[2]).toAbsolutePath()
                     );
+                }
+                case "list" -> {
+                    requireArguments(args, 2);
+                    FileTreeCodec.Listing listing = FileTreeCodec.list(Path.of(args[1]));
+                    System.out.printf("%d files, %d directories, %d content bytes%n",
+                            listing.summary().fileCount(), listing.summary().directoryCount(),
+                            listing.summary().contentSize());
+                    for (FileTreeCodec.Entry entry : listing.entries()) {
+                        System.out.printf("%s %12d %s%n", entry.directory() ? "dir " : "file",
+                                entry.size(), entry.path());
+                    }
                 }
                 default -> {
                     printUsage();
@@ -52,11 +81,25 @@ public final class FileCodecCli {
         }
     }
 
+    private static void requireArguments(String[] args, int count) {
+        if (args.length != count) {
+            throw new IllegalArgumentException(args[0] + " expects " + (count - 1) + " arguments");
+        }
+    }
+
+    private static void printTreePack(FileTreeCodec.Summary summary, Path schematic) {
+        System.out.printf("Packed %d bytes in %d files and %d directories into %d books in %d barrels: %s%n",
+                summary.contentSize(), summary.fileCount(), summary.directoryCount(),
+                summary.archive().bookCount(), summary.archive().barrelCount(), schematic.toAbsolutePath());
+    }
+
     private static void printUsage() {
         System.out.println("""
                 Usage:
-                  gradlew runFileCodec --args="pack <input-file> <output.litematic>"
-                  gradlew runFileCodec --args="restore <input.litematic> <output-file>"
+                  gradlew runFileCodec --args="pack <input-file-or-directory> <output.litematic>"
+                  gradlew runFileCodec --args="pack-tree <root-directory> <output.litematic> [relative-path ...]"
+                  gradlew runFileCodec --args="list <input.litematic>"
+                  gradlew runFileCodec --args="restore <input.litematic> <output-file-or-directory>"
                 """);
     }
 }
