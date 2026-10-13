@@ -104,6 +104,25 @@ tasks.register('benchmarkPageEncoding', JavaExec) {
     maxHeapSize = '128m'
 }
 
+tasks.register('benchmarkBase85', JavaExec) {
+    group = 'verification'
+    description = 'Compares Base64 with an isolated Base85 codec using complete pack/restore calls.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'awszqsedxzaw.cloudarchive.codec.Base85CodecBenchmark'
+    maxHeapSize = '128m'
+    workingDir = projectDir
+}
+
+tasks.register('benchmarkCompressionTuning', JavaExec) {
+    group = 'verification'
+    description = 'Measures Zstandard context reuse, workers, levels and outer gzip levels.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'awszqsedxzaw.cloudarchive.codec.CompressionTuningBenchmark'
+    maxHeapSize = '128m'
+}
+
 tasks.named('check') {
     dependsOn tasks.named('verifyFileCodec')
 }

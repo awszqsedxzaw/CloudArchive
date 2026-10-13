@@ -6,8 +6,8 @@
 
 投影使用一个 `FileStorage` 区域，尺寸为 `N x 1 x 1`，木桶坐标为 `(0, 0, 0)` 到 `(N-1, 0, 0)`。
 
-- `x=0`：唯一的元数据木桶，书标题为 `Metadata`。
-- `x>=1`：数据木桶，书标题为 `Data`，只包含压缩数据块或 RAW 字节。
+- `x=0`：唯一的元数据木桶，书标题为 `M`。
+- `x>=1`：数据木桶，书标题为 `D`，只包含压缩数据块或 RAW 字节。
 
 元数据木桶最多 27 本书。空文件或空目录树只有元数据木桶，不包含数据书。每个数据木桶最多 27 本书。非末尾书必须写满 100 页，末尾书也只有最后一页可以不满。
 
@@ -21,6 +21,8 @@ MinecraftDataVersion = 3465
 
 调色板的 0 号为 `minecraft:air`，1 号为 `minecraft:barrel`。所有木桶的实体坐标和 X 顺序必须保留。NBT compound 字段顺序不重要。
 
+投影元数据的作者为 `CA`，描述为空字符串；名称、区域数量、总块数、总体积、包围尺寸及真实创建/修改时间均保留，不缩写标准字段名。
+
 ## 原生书 NBT
 
 书物品只允许下列原生字段：
@@ -31,16 +33,15 @@ MinecraftDataVersion = 3465
   Count: 1b,
   Slot: 0..26b,
   tag: {
-    author: "CloudArchive",
-    title: "Metadata" | "Data",
-    generation: 0,
+    author: "CA",
+    title: "M" | "D",
     resolved: true,
     pages: [ "URL-safe unpadded Base64", ... ]
   }
 }
 ```
 
-不允许任何额外 item 或 `tag` 字段。每本书 1 到 100 页；除最后一页外，每页解码后必须是 24,573 字节。页面顺序是数据顺序，书的地址由木桶 X 和 `Slot` 决定：
+不允许任何额外 item 或 `tag` 字段。省略原生书本的 `generation`，Minecraft 将缺省值视为 0；这与下面二进制元数据头中的 `generation` 无关。`resolved=true` 必须保留，避免游戏重新解析页内容。旧标题或旧书本字段布局不受支持，必须重新打包。每本书 1 到 100 页；除最后一页外，每页解码后必须是 24,573 字节。页面顺序是数据顺序，书的地址由木桶 X 和 `Slot` 决定：
 
 ```text
 metadata_book_index = Slot
@@ -48,6 +49,8 @@ data_book_index = (barrel_x - 1) * 27 + Slot
 ```
 
 Base64 页按无填充 URL-safe 编码。每页最多 32,764 个 ASCII 字符，对应 24,573 字节。数据书不能通过普通书界面编辑。
+
+写入器复用一本书的页输入、编码输出和文件通道缓冲区。Base64 ASCII 字节与 NBT modified UTF-8 表示相同，按编码实际长度直接写入，不增加 JSON 包装。
 
 ## 元数据文件
 
@@ -117,7 +120,7 @@ extent 偏移从解压后的逻辑数据文件的字节 0 开始，不包含任�
 | 4 | raw_length：1 到 4,194,304 |
 | 4 | stored_length：正数，不超过 raw_length |
 
-RAW 块必须满足 `stored_length == raw_length`；Zstandard 块必须满足 `stored_length < raw_length`。每个 Zstandard 块是独立、无外部字典的标准帧，写入器使用级别 6。块没有 CloudArchive 数据头，也没有对齐填充；数据木桶只拼接各块的存储字节。全部类型和长度描述均位于元数据木桶。
+RAW 块必须满足 `stored_length == raw_length`；Zstandard 块必须满足 `stored_length < raw_length`。每个 Zstandard 块是独立、无外部字典的标准帧，写入器使用级别 3。块没有 CloudArchive 数据头，也没有对齐填充；数据木桶只拼接各块的存储字节。全部类型和长度描述均位于元数据木桶。
 
 块的逻辑起点为前面块的 `raw_length` 之和，存储起点为前面块的 `stored_length` 之和，无需重复存储偏移。两种长度之和必须分别等于固定头的 `data_length` 和 `stored_length`；未知 codec、越界长度、解压长度不匹配或尾随字节均拒绝。整体逻辑数据 SHA-256 与每个文件 SHA-256 用于校验。
 

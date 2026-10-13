@@ -13,11 +13,13 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.Set;
+import net.minecraft.nbt.NbtByte;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
 import net.minecraft.nbt.NbtList;
@@ -35,11 +37,12 @@ public final class LitematicaFileCodec {
     static final long MAX_ARCHIVE_BYTES = BYTES_PER_BOOK * Integer.MAX_VALUE;
     static final String BOOK_ID = "minecraft:written_book";
     static final String BARREL_ID = "minecraft:barrel";
-    private static final String AUTHOR = "CloudArchive";
-    private static final String METADATA_TITLE = "Metadata";
-    private static final String DATA_TITLE = "Data";
+    private static final String AUTHOR = "CA";
+    private static final String METADATA_TITLE = "M";
+    private static final String DATA_TITLE = "D";
     private static final Base64.Encoder BASE64_ENCODER = Base64.getUrlEncoder().withoutPadding();
     private static final Base64.Decoder BASE64_DECODER = Base64.getUrlDecoder();
+    private static final int[] BASE64_VALUES = createBase64Values();
 
     private LitematicaFileCodec() {
     }
@@ -155,7 +158,7 @@ public final class LitematicaFileCodec {
         NbtCompound metadata = new NbtCompound();
         metadata.putString("Name", name);
         metadata.putString("Author", AUTHOR);
-        metadata.putString("Description", "CloudArchive data and metadata barrels");
+        metadata.putString("Description", "");
         metadata.putInt("RegionCount", 1);
         metadata.putInt("TotalVolume", barrelCount);
         metadata.putInt("TotalBlocks", barrelCount);
@@ -282,40 +285,32 @@ public final class LitematicaFileCodec {
         if (length <= 0 || length > BYTES_PER_BOOK) {
             throw new IOException("Archive book has an invalid length");
         }
-        NbtList pages = new NbtList();
+        writeTag(output, "id", NbtString.of(BOOK_ID));
+        writeTag(output, "Count", NbtByte.of((byte) 1));
+        writeTag(output, "Slot", NbtByte.of((byte) slot));
+        writeCompoundStart(output, "tag");
+        writeTag(output, "author", NbtString.of(AUTHOR));
+        writeTag(output, "title", NbtString.of(title));
+        writeTag(output, "resolved", NbtByte.of((byte) 1));
+        int pageCount = (int) ((length + BYTES_PER_PAGE - 1) / BYTES_PER_PAGE);
+        writeListStart(output, "pages", NbtElement.STRING_TYPE, pageCount);
+        source.position(offset);
+        byte[] chunk = new byte[(int) Math.min(length, BYTES_PER_PAGE)];
+        ByteBuffer buffer = ByteBuffer.wrap(chunk);
+        byte[] page = new byte[(chunk.length * 4 + 2) / 3];
         long remaining = length;
-        long position = offset;
         while (remaining > 0) {
             int chunkSize = (int) Math.min(remaining, BYTES_PER_PAGE);
-            byte[] chunk = new byte[chunkSize];
-            ByteBuffer buffer = ByteBuffer.wrap(chunk);
-            source.position(position);
+            buffer.clear().limit(chunkSize);
             readFully(source, buffer);
-            pages.add(NbtString.of(BASE64_ENCODER.encodeToString(chunk)));
-            position += chunkSize;
+            byte[] input = chunkSize == chunk.length ? chunk : Arrays.copyOf(chunk, chunkSize);
+            int pageLength = BASE64_ENCODER.encode(input, page);
+            // Base64 ASCII is identical to its NBT modified UTF-8 representation.
+            output.writeShort(pageLength);
+            output.write(page, 0, pageLength);
             remaining -= chunkSize;
         }
-        if (pages.isEmpty() || pages.size() > MAX_PAGES_PER_BOOK) {
-            throw new IOException("Archive book page count is invalid");
-        }
-        NbtCompound tag = new NbtCompound();
-        tag.putString("author", AUTHOR);
-        tag.putString("title", title);
-        tag.putInt("generation", 0);
-        tag.putBoolean("resolved", true);
-        tag.put("pages", pages);
-        NbtCompound stack = new NbtCompound();
-        stack.putString("id", BOOK_ID);
-        stack.putByte("Count", (byte) 1);
-        stack.putByte("Slot", (byte) slot);
-        stack.put("tag", tag);
-        writeCompound(output, stack);
-    }
-
-    private static void writeCompound(DataOutput output, NbtCompound value) throws IOException {
-        for (String key : value.getKeys()) {
-            writeTag(output, key, value.get(key));
-        }
+        output.writeByte(NbtElement.END_TYPE);
         output.writeByte(NbtElement.END_TYPE);
     }
 
@@ -359,21 +354,16 @@ public final class LitematicaFileCodec {
         if (page.length() > MAX_PAGE_CHARS) {
             throw new IOException("Archive page exceeds the supported page capacity");
         }
+        int last = -1;
         for (int i = 0; i < page.length(); i++) {
             char character = page.charAt(i);
-            boolean valid = character >= 'A' && character <= 'Z'
-                    || character >= 'a' && character <= 'z'
-                    || character >= '0' && character <= '9'
-                    || character == '-' || character == '_';
-            if (!valid) {
+            last = character < BASE64_VALUES.length ? BASE64_VALUES[character] : -1;
+            if (last < 0) {
                 throw new IOException("Archive page contains invalid Base64 data");
             }
         }
         try {
             int remainder = page.length() & 3;
-            int last = page.isEmpty() ? -1
-                    : "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-                            .indexOf(page.charAt(page.length() - 1));
             if (page.isEmpty() || remainder == 1
                     || remainder == 2 && (last & 15) != 0 || remainder == 3 && (last & 3) != 0) {
                 throw new IOException("Archive page contains empty or noncanonical Base64 data");
@@ -382,6 +372,16 @@ public final class LitematicaFileCodec {
         } catch (IllegalArgumentException exception) {
             throw new IOException("Archive page contains invalid Base64 data", exception);
         }
+    }
+
+    private static int[] createBase64Values() {
+        int[] values = new int[128];
+        Arrays.fill(values, -1);
+        String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        for (int i = 0; i < alphabet.length(); i++) {
+            values[alphabet.charAt(i)] = i;
+        }
+        return values;
     }
 
     private static NbtList readBook(NbtCompound stack, String expectedTitle) throws IOException {
@@ -395,15 +395,13 @@ public final class LitematicaFileCodec {
             throw new IOException("Archive book item NBT is invalid");
         }
         NbtCompound tag = stack.getCompound("tag");
-        if (!tag.getKeys().equals(Set.of("author", "title", "generation", "resolved", "pages"))
+        if (!tag.getKeys().equals(Set.of("author", "title", "resolved", "pages"))
                 || !tag.contains("author", NbtElement.STRING_TYPE)
                 || !tag.contains("title", NbtElement.STRING_TYPE)
-                || !tag.contains("generation", NbtElement.INT_TYPE)
                 || !tag.contains("resolved", NbtElement.BYTE_TYPE)
                 || !tag.contains("pages", NbtElement.LIST_TYPE)
                 || !AUTHOR.equals(tag.getString("author"))
                 || !expectedTitle.equals(tag.getString("title"))
-                || tag.getInt("generation") != 0
                 || !tag.getBoolean("resolved")) {
             throw new IOException("Archive book uses unsupported or invalid written-book fields");
         }

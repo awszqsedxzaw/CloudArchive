@@ -6,6 +6,8 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -32,6 +34,7 @@ public final class FileCodecSelfTest {
     public static void main(String[] args) throws Exception {
         Path work = Files.createTempDirectory("cloudarchive-codec-test-");
         try {
+            verifyPageDecoder();
             roundTrip(work, "empty.bin", 0);
             roundTrip(work, "exact-page.bin", LitematicaFileCodec.BYTES_PER_PAGE);
             roundTrip(work, "unicode-\u6570\u636e.bin", LitematicaFileCodec.BYTES_PER_PAGE + 17);
@@ -53,6 +56,38 @@ public final class FileCodecSelfTest {
         } finally {
             deleteTree(work);
         }
+    }
+
+    private static void verifyPageDecoder() throws Exception {
+        Method decoder = LitematicaFileCodec.class.getDeclaredMethod("decodePage", String.class);
+        decoder.setAccessible(true);
+        String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        for (int character = 0; character <= Character.MAX_VALUE; character++) {
+            String page = "AA" + (char) character + "A";
+            boolean supported = alphabet.indexOf(character) >= 0;
+            try {
+                byte[] bytes = (byte[]) decoder.invoke(null, page);
+                require(supported && Arrays.equals(bytes, Base64.getUrlDecoder().decode(page)),
+                        "Page decoder accepted an unsupported character");
+            } catch (InvocationTargetException exception) {
+                require(!supported && exception.getCause() instanceof IOException,
+                        "Page decoder rejected a supported character");
+            }
+        }
+        for (String prefix : new String[]{"A", "AA"}) {
+            for (int i = 0; i < alphabet.length(); i++) {
+                String page = prefix + alphabet.charAt(i);
+                byte[] bytes = Base64.getUrlDecoder().decode(page);
+                boolean canonical = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes).equals(page);
+                try {
+                    byte[] actual = (byte[]) decoder.invoke(null, page);
+                    require(canonical && Arrays.equals(bytes, actual), "Noncanonical page tail accepted");
+                } catch (InvocationTargetException exception) {
+                    require(!canonical && exception.getCause() instanceof IOException, "Canonical page tail rejected");
+                }
+            }
+        }
+        System.out.println("All UTF-16 characters and Base64 tail canonicality checks passed");
     }
 
     private static void roundTrip(Path work, String name, int size) throws IOException {
@@ -137,10 +172,10 @@ public final class FileCodecSelfTest {
         require(book.getString("id").equals("minecraft:written_book") && book.getByte("Count") == 1,
                 "Invalid written-book stack");
         NbtCompound tag = book.getCompound("tag");
-        require(tag.getKeys().equals(Set.of("author", "title", "generation", "resolved", "pages")),
+        require(tag.getKeys().equals(Set.of("author", "title", "resolved", "pages")),
                 "Custom book tags found");
-        require(tag.getString("author").equals("CloudArchive")
-                && tag.getString("title").equals(metadata ? "Metadata" : "Data")
+        require(tag.getString("author").equals("CA")
+                && tag.getString("title").equals(metadata ? "M" : "D")
                 && tag.getInt("generation") == 0 && tag.getBoolean("resolved"), "Native book fields differ");
         NbtList pages = tag.getList("pages", NbtElement.STRING_TYPE);
         require(!pages.isEmpty() && pages.size() <= 100, "Invalid page count");

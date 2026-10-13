@@ -1,6 +1,8 @@
 package awszqsedxzaw.cloudarchive.codec;
 
 import com.github.luben.zstd.Zstd;
+import com.github.luben.zstd.ZstdCompressCtx;
+import com.github.luben.zstd.ZstdDecompressCtx;
 import com.github.luben.zstd.ZstdException;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -16,7 +18,7 @@ import java.util.HexFormat;
 import java.util.List;
 
 final class DataCompression {
-    static final int LEVEL = 6;
+    static final int LEVEL = 3;
 
     private DataCompression() {
     }
@@ -27,10 +29,11 @@ final class DataCompression {
         byte[] source = new byte[TreeArchiveFormat.BLOCK_BYTES];
         byte[] compressed = new byte[(int) Zstd.compressBound(source.length)];
         try (InputStream input = new BufferedInputStream(Files.newInputStream(raw));
-             OutputStream output = new BufferedOutputStream(Files.newOutputStream(stored))) {
+             OutputStream output = new BufferedOutputStream(Files.newOutputStream(stored));
+             ZstdCompressCtx compressor = new ZstdCompressCtx().setLevel(LEVEL)) {
             int count;
             while ((count = input.readNBytes(source, 0, source.length)) > 0) {
-                long result = Zstd.compressByteArray(compressed, 0, compressed.length, source, 0, count, LEVEL);
+                long result = compressor.compressByteArray(compressed, 0, compressed.length, source, 0, count);
                 check(result);
                 boolean smaller = result < count;
                 int storedSize = smaller ? (int) result : count;
@@ -48,7 +51,8 @@ final class DataCompression {
         MessageDigest digest = LitematicaFileCodec.newSha256();
         byte[] source = new byte[TreeArchiveFormat.BLOCK_BYTES];
         byte[] decoded = new byte[TreeArchiveFormat.BLOCK_BYTES];
-        try (InputStream input = new BufferedInputStream(Files.newInputStream(stored))) {
+        try (InputStream input = new BufferedInputStream(Files.newInputStream(stored));
+             ZstdDecompressCtx decompressor = new ZstdDecompressCtx()) {
             DigestOutputStream verified = new DigestOutputStream(raw, digest);
             for (TreeArchiveFormat.Block block : manifest.blocks()) {
                 if (input.readNBytes(source, 0, block.storedLength()) != block.storedLength()) {
@@ -57,7 +61,7 @@ final class DataCompression {
                 if (block.codec() == 0) {
                     verified.write(source, 0, block.rawLength());
                 } else {
-                    long size = Zstd.decompressByteArray(decoded, 0, block.rawLength(),
+                    long size = decompressor.decompressByteArray(decoded, 0, block.rawLength(),
                             source, 0, block.storedLength());
                     check(size);
                     if (size != block.rawLength()) {

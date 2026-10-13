@@ -59,7 +59,6 @@ final class ArchiveBookScanner extends NbtCollector {
         } else if (depth == 8) {
             include = switch (key) {
                 case "author", "title" -> type == NbtString.TYPE;
-                case "generation" -> type == NbtInt.TYPE;
                 case "resolved" -> type == NbtByte.TYPE;
                 case "pages" -> type == NbtList.TYPE;
                 default -> false;
