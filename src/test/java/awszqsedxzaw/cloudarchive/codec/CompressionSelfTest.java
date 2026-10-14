@@ -19,6 +19,7 @@ final class CompressionSelfTest {
     }
 
     static void run(Path work) throws IOException {
+        verifyEncoderRollback(work);
         Path source = Files.createDirectory(work.resolve("compressed-source"));
         Path file = source.resolve("a.txt");
         try (OutputStream output = Files.newOutputStream(file)) {
@@ -92,5 +93,59 @@ final class CompressionSelfTest {
                     "Standard gzip reader did not decode all parallel members");
         }
         System.out.println("Zstandard blocks, RAW fallback, deduplication, corruption and standard gzip checks passed");
+    }
+
+    private static void verifyEncoderRollback(Path work) throws IOException {
+        byte[] prefix = randomBytes(31_173, 41);
+        byte[] content = randomBytes(TreeArchiveFormat.BLOCK_BYTES + 12_345, 42);
+        byte[] suffix = randomBytes(91, 43);
+        Path actual = work.resolve("rollback-stored");
+        try (DataCompression.Encoder encoder = new DataCompression.Encoder(actual)) {
+            encoder.write(prefix);
+            encoder.checkpoint();
+            encoder.write(content); // Discard multiple blocks, preserving the buffered prefix.
+            encoder.write(content);
+            encoder.rollback();
+            encoder.checkpoint();
+            encoder.write(content);
+            encoder.commit();
+            encoder.checkpoint();
+            encoder.write(suffix); // Roll back without flushing or copying the prefix.
+            encoder.rollback();
+            encoder.write(suffix);
+            encoder.finish();
+        }
+        Path raw = work.resolve("rollback-raw");
+        try (OutputStream output = Files.newOutputStream(raw)) {
+            output.write(prefix);
+            output.write(content);
+            output.write(suffix);
+        }
+        Path expected = work.resolve("rollback-expected");
+        DataCompression.encode(raw, expected);
+        require(Files.mismatch(actual, expected) == -1, "Rollback changed the compression stream");
+
+        Path source = Files.createDirectory(work.resolve("rollback-tree"));
+        Files.write(source.resolve("a.bin"), prefix);
+        Files.write(source.resolve("b.bin"), content);
+        Files.write(source.resolve("c-duplicate.bin"), content);
+        byte[] different = content.clone();
+        different[0] ^= 1;
+        Files.write(source.resolve("d-same-size.bin"), different);
+        Files.write(source.resolve("e-small-duplicate.bin"), prefix);
+        Files.write(source.resolve("f.bin"), suffix);
+        Path archive = work.resolve("rollback-tree.litematic");
+        FileTreeCodec.Summary info = FileTreeCodec.pack(source, archive);
+        require(info.archive().dataSize() == prefix.length + content.length * 2L + suffix.length,
+                "Single-read deduplication discarded unequal contents or retained duplicates");
+        Path restored = work.resolve("rollback-tree-restored");
+        FileTreeCodec.restore(archive, restored);
+        try (var paths = Files.list(source)) {
+            for (Path path : paths.toList()) {
+                require(Files.mismatch(path, restored.resolve(path.getFileName())) == -1,
+                        "Transactional deduplication changed file contents");
+            }
+        }
+        System.out.println("Streaming compression rollback and equal-size collision checks passed");
     }
 }

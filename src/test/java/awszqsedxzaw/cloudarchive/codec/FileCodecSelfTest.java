@@ -44,6 +44,7 @@ public final class FileCodecSelfTest {
             verifyMalformedBooksAndLayout(work);
             verifyMetadataCorruption(work);
             verifyOrderIndependence(work);
+            verifyStreamIntegrity(work);
             verifyExtensionsAndStateBoundary(work);
             verifyMultiBarrel(work);
             TreeCodecSelfTest.run(work);
@@ -353,6 +354,28 @@ public final class FileCodecSelfTest {
         require(Files.exists(work.resolve("extension.litematic")), "Output extension differs");
     }
 
+    private static void verifyStreamIntegrity(Path work) throws IOException {
+        byte[] bytes = Files.readAllBytes(work.resolve("exact-page.bin.litematic"));
+        for (int removed : new int[]{1, 8, bytes.length / 2}) {
+            Path truncated = work.resolve("truncated-" + removed + ".litematic");
+            Files.write(truncated, Arrays.copyOf(bytes, bytes.length - removed));
+            rejectArchive(truncated, work.resolve("truncated-" + removed + ".restored"));
+        }
+        byte[] corrupt = bytes.clone();
+        corrupt[corrupt.length - 8] ^= 1;
+        Path crc = work.resolve("bad-gzip-crc.litematic");
+        Files.write(crc, corrupt);
+        rejectArchive(crc, work.resolve("bad-gzip-crc.restored"));
+        Path trailing = work.resolve("trailing-nbt.litematic");
+        Files.write(trailing, bytes);
+        try (OutputStream output = new GZIPOutputStream(Files.newOutputStream(trailing,
+                java.nio.file.StandardOpenOption.APPEND))) {
+            output.write(0);
+        }
+        rejectArchive(trailing, work.resolve("trailing-nbt.restored"));
+        System.out.println("Truncated gzip, checksum and trailing NBT checks passed");
+    }
+
     private static void verifyMultiBarrel(Path work) throws IOException {
         long size = LitematicaFileCodec.BYTES_PER_BARREL + 31;
         Path input = work.resolve("multi-barrel.bin");
@@ -372,20 +395,20 @@ public final class FileCodecSelfTest {
                 && info.totalBookCount() == 29 && info.barrelCount() == 3, "Multi-barrel counts differ");
         AtomicInteger metadataBooks = new AtomicInteger();
         AtomicInteger dataBooks = new AtomicInteger();
-        ArchiveLayoutScanner.Layout layout = ArchiveLayoutScanner.read(archive);
-        ArchiveBookScanner scanner = new ArchiveBookScanner(layout, book -> {
-            verifyBook(book.stack(), book.x() == 0);
+        StreamingArchiveScanner scanner = new StreamingArchiveScanner((page, count, encoded) -> {
+            require(encoded.length() <= LitematicaFileCodec.MAX_PAGE_CHARS, "Oversized streaming page");
+        }, book -> {
             if (book.x() == 0) {
                 metadataBooks.incrementAndGet();
             } else {
-                int index = (book.x() - 1) * 27 + (book.stack().getByte("Slot") & 255);
+                int index = (book.x() - 1) * 27 + book.slot();
                 dataBooks.incrementAndGet();
-                require(pages(book.stack()).size() == (index < 27 ? 100 : 1),
+                require(book.pageCount() == (index < 27 ? 100 : 1),
                         "Multi-barrel page count differs");
             }
-        });
+        }, x -> { });
         NbtIo.scanCompressed(archive.toFile(), scanner);
-        require(layout.barrelCount() == 3, "Multi-barrel layout differs");
+        require(scanner.barrelCount() == 3, "Multi-barrel layout differs");
         require(metadataBooks.get() == 1 && dataBooks.get() == 28, "Streaming scan lost books");
         Path restored = work.resolve("multi-barrel.restored");
         LitematicaFileCodec.restore(archive, restored);

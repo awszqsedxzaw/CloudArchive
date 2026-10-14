@@ -95,6 +95,24 @@ tasks.register('benchmarkFileCodec', JavaExec) {
     maxHeapSize = '128m'
 }
 
+tasks.register('verifyLargeFileCodec', JavaExec) {
+    group = 'verification'
+    description = 'Verifies 512 MiB incompressible and over-2-GiB inputs with a 64 MiB heap.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'awszqsedxzaw.cloudarchive.codec.LargeFileCodecSelfTest'
+    maxHeapSize = '64m'
+}
+
+tasks.register('benchmarkCodecComparison', JavaExec) {
+    group = 'verification'
+    description = 'Alternates baseline/current codec JVMs with identical inputs and a 128 MiB heap.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'awszqsedxzaw.cloudarchive.codec.CodecComparisonBenchmark'
+    maxHeapSize = '128m'
+}
+
 tasks.register('benchmarkPageEncoding', JavaExec) {
     group = 'verification'
     description = 'Compares native NBT string encodings and gzip levels.'

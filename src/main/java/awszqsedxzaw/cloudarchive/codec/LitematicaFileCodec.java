@@ -15,10 +15,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.Base64;
-import java.util.HashMap;
 import java.util.HexFormat;
-import java.util.Map;
-import java.util.Set;
 import net.minecraft.nbt.NbtByte;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
@@ -37,11 +34,10 @@ public final class LitematicaFileCodec {
     static final long MAX_ARCHIVE_BYTES = BYTES_PER_BOOK * Integer.MAX_VALUE;
     static final String BOOK_ID = "minecraft:written_book";
     static final String BARREL_ID = "minecraft:barrel";
-    private static final String AUTHOR = "CA";
+    static final String AUTHOR = "CA";
     private static final String METADATA_TITLE = "M";
     private static final String DATA_TITLE = "D";
     private static final Base64.Encoder BASE64_ENCODER = Base64.getUrlEncoder().withoutPadding();
-    private static final Base64.Decoder BASE64_DECODER = Base64.getUrlDecoder();
     private static final int[] BASE64_VALUES = createBase64Values();
 
     private LitematicaFileCodec() {
@@ -74,7 +70,6 @@ public final class LitematicaFileCodec {
         if (manifest.kind() != expectedKind || manifest.storedLength() != Files.size(dataPath)) {
             throw new IOException("Archive staging metadata and data do not match");
         }
-        DataCompression.decode(dataPath, java.io.OutputStream.nullOutputStream(), manifest);
         int metadataBooks = TreeArchiveFormat.metadataBookCount(Files.size(metadataPath));
         if (metadataBooks > INVENTORY_SLOTS) {
             throw new IOException("Metadata needs more than one barrel");
@@ -103,15 +98,23 @@ public final class LitematicaFileCodec {
                     StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
                  FileChannel data = FileChannel.open(storedOutput,
                          StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
-                RestoreState state = new RestoreState(metadata, data);
-                ArchiveLayoutScanner.Layout layout = ArchiveLayoutScanner.read(source);
-                ArchiveBookScanner scanner = new ArchiveBookScanner(layout, state::acceptBook);
-                try {
-                    net.minecraft.nbt.NbtIo.scanCompressed(source.toFile(), scanner);
-                } catch (java.io.UncheckedIOException exception) {
-                    throw exception.getCause();
+                try (RestoreState state = new RestoreState(metadata, data, storedOutput.getParent())) {
+                    StreamingArchiveScanner scanner = new StreamingArchiveScanner(
+                            state::acceptPage, state::acceptBook, state::acceptBarrel);
+                    // Larger gzip input buffers avoid a native inflater call per 512 bytes.
+                    try (var compressed = new java.util.zip.GZIPInputStream(
+                            Files.newInputStream(source), 64 * 1024);
+                         var inputStream = new java.io.DataInputStream(
+                                 new java.io.BufferedInputStream(compressed, 64 * 1024))) {
+                        net.minecraft.nbt.NbtIo.scan(inputStream, scanner);
+                        if (inputStream.read() != -1) {
+                            throw new IOException("Archive contains trailing NBT data");
+                        }
+                    } catch (java.io.UncheckedIOException exception) {
+                        throw exception.getCause();
+                    }
+                    manifest = state.finish(metadataOutput, storedOutput, scanner.barrelCount());
                 }
-                manifest = state.finish(metadataOutput, storedOutput, layout.barrelCount());
             }
             try (java.io.OutputStream output = new BufferedOutputStream(Files.newOutputStream(dataOutput,
                     StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE))) {
@@ -344,27 +347,53 @@ public final class LitematicaFileCodec {
     }
 
     private static byte[] decodePage(String page) throws IOException {
+        byte[] bytes = new byte[page.length() / 4 * 3 + (page.length() % 4 * 3) / 4];
+        decodePage(page, bytes, 0);
+        return bytes;
+    }
+
+    private static int decodePage(String page, byte[] target, int offset) throws IOException {
         if (page.length() > MAX_PAGE_CHARS) {
             throw new IOException("Archive page exceeds the supported page capacity");
         }
-        int last = -1;
-        for (int i = 0; i < page.length(); i++) {
-            char character = page.charAt(i);
-            last = character < BASE64_VALUES.length ? BASE64_VALUES[character] : -1;
-            if (last < 0) {
+        int length = page.length();
+        int remainder = length & 3;
+        if (length == 0 || remainder == 1) {
+            throw new IOException("Archive page contains empty or noncanonical Base64 data");
+        }
+        int position = offset;
+        int full = length - remainder;
+        for (int i = 0; i < full; i += 4) {
+            int a = base64Value(page.charAt(i));
+            int b = base64Value(page.charAt(i + 1));
+            int c = base64Value(page.charAt(i + 2));
+            int d = base64Value(page.charAt(i + 3));
+            if ((a | b | c | d) < 0) {
                 throw new IOException("Archive page contains invalid Base64 data");
             }
+            int bits = a << 18 | b << 12 | c << 6 | d;
+            target[position++] = (byte) (bits >>> 16);
+            target[position++] = (byte) (bits >>> 8);
+            target[position++] = (byte) bits;
         }
-        try {
-            int remainder = page.length() & 3;
-            if (page.isEmpty() || remainder == 1
-                    || remainder == 2 && (last & 15) != 0 || remainder == 3 && (last & 3) != 0) {
-                throw new IOException("Archive page contains empty or noncanonical Base64 data");
+        if (remainder > 0) {
+            int a = base64Value(page.charAt(full));
+            int b = base64Value(page.charAt(full + 1));
+            int c = remainder == 3 ? base64Value(page.charAt(full + 2)) : 0;
+            if ((a | b | c) < 0 || remainder == 2 && (b & 15) != 0
+                    || remainder == 3 && (c & 3) != 0) {
+                throw new IOException("Archive page contains invalid or noncanonical Base64 data");
             }
-            return BASE64_DECODER.decode(page);
-        } catch (IllegalArgumentException exception) {
-            throw new IOException("Archive page contains invalid Base64 data", exception);
+            target[position++] = (byte) (a << 2 | b >>> 4);
+            if (remainder == 3) {
+                target[position++] = (byte) (b << 4 | c >>> 2);
+            }
         }
+        return position - offset;
+    }
+
+    private static int base64Value(char value) {
+        return value < BASE64_VALUES.length ? BASE64_VALUES[value] : -1;
     }
 
     private static int[] createBase64Values() {
@@ -375,51 +404,6 @@ public final class LitematicaFileCodec {
             values[alphabet.charAt(i)] = i;
         }
         return values;
-    }
-
-    private static NbtList readBook(NbtCompound stack, String expectedTitle) throws IOException {
-        if (!stack.getKeys().equals(Set.of("id", "Count", "Slot", "tag"))
-                || !BOOK_ID.equals(stack.getString("id"))
-                || !stack.contains("Count", NbtElement.BYTE_TYPE)
-                || stack.getByte("Count") != 1
-                || !stack.contains("Slot", NbtElement.BYTE_TYPE)
-                || (stack.getByte("Slot") & 0xFF) >= INVENTORY_SLOTS
-                || !stack.contains("tag", NbtElement.COMPOUND_TYPE)) {
-            throw new IOException("Archive book item NBT is invalid");
-        }
-        NbtCompound tag = stack.getCompound("tag");
-        if (!tag.getKeys().equals(Set.of("author", "title", "resolved", "pages"))
-                || !tag.contains("author", NbtElement.STRING_TYPE)
-                || !tag.contains("title", NbtElement.STRING_TYPE)
-                || !tag.contains("resolved", NbtElement.BYTE_TYPE)
-                || !tag.contains("pages", NbtElement.LIST_TYPE)
-                || !AUTHOR.equals(tag.getString("author"))
-                || !expectedTitle.equals(tag.getString("title"))
-                || !tag.getBoolean("resolved")) {
-            throw new IOException("Archive book uses unsupported or invalid written-book fields");
-        }
-        NbtList pages = tag.getList("pages", NbtElement.STRING_TYPE);
-        if (pages.isEmpty() || pages.size() > MAX_PAGES_PER_BOOK) {
-            throw new IOException("Archive book has an invalid page count");
-        }
-        return pages;
-    }
-
-    private static long writePages(FileChannel channel, NbtList pages, long offset) throws IOException {
-        long position = offset;
-        for (int i = 0; i < pages.size(); i++) {
-            byte[] bytes = decodePage(pages.getString(i));
-            if (i < pages.size() - 1 && bytes.length != BYTES_PER_PAGE) {
-                throw new IOException("Archive book contains an incomplete non-final page");
-            }
-            ByteBuffer buffer = ByteBuffer.wrap(bytes);
-            channel.position(position);
-            while (buffer.hasRemaining()) {
-                channel.write(buffer);
-            }
-            position += bytes.length;
-        }
-        return position - offset;
     }
 
     private static void moveWithoutReplacing(Path temporary, Path destination) throws IOException {
@@ -450,83 +434,138 @@ public final class LitematicaFileCodec {
         return HexFormat.of().formatHex(digest.digest());
     }
 
-    private static final class RestoreState {
+    private static final class RestoreState implements AutoCloseable {
         private final FileChannel metadata;
         private final FileChannel data;
-        private final Map<Integer, Long> metadataBooks = new HashMap<>();
-        private final Map<Integer, Long> dataBooks = new HashMap<>();
+        private final Path work;
+        private final byte[] book = new byte[(int) BYTES_PER_BOOK];
+        private final ByteBuffer buffer = ByteBuffer.wrap(book);
+        private final int[] pendingLengths = new int[INVENTORY_SLOTS];
+        private final String[] pendingTitles = new String[INVENTORY_SLOTS];
+        private final BookLengths metadataBooks = new BookLengths();
+        private final BookLengths dataBooks = new BookLengths();
+        private int bookLength;
+        private Path pendingPath;
+        private FileChannel pending;
 
-        private RestoreState(FileChannel metadata, FileChannel data) {
+        private RestoreState(FileChannel metadata, FileChannel data, Path work) {
             this.metadata = metadata;
             this.data = data;
+            this.work = work;
         }
 
-        private void acceptBook(ArchiveBookScanner.ArchiveBook archiveBook) throws IOException {
-            if (archiveBook.y() != 0 || archiveBook.z() != 0) {
-                throw new IOException("Archive barrel is outside the supported layout");
+        private void acceptPage(int page, int pageCount, String encoded)
+                throws IOException {
+            int length = decodePage(encoded, book, page * BYTES_PER_PAGE);
+            if (page < pageCount - 1 && length != BYTES_PER_PAGE) {
+                throw new IOException("Archive book contains an incomplete non-final page");
             }
-            if (archiveBook.x() < 0) {
-                throw new IOException("Archive barrel has an invalid X coordinate");
-            }
-            String title = archiveBook.x() == 0 ? METADATA_TITLE : DATA_TITLE;
-            NbtList pages = readBook(archiveBook.stack(), title);
-            int slot = archiveBook.stack().getByte("Slot") & 0xFF;
-            if (archiveBook.x() == 0) {
-                if (!metadataBooks.containsKey(slot)) {
-                    metadataBooks.put(slot, writePages(metadata, pages, (long) slot * BYTES_PER_BOOK));
-                } else {
-                    throw new IOException("Archive metadata contains duplicate inventory slots");
+            bookLength = page * BYTES_PER_PAGE + length;
+        }
+
+        private void acceptBook(StreamingArchiveScanner.ArchiveBook item) throws IOException {
+            if (item.x() < 0) {
+                if (pending == null) {
+                    pendingPath = Files.createTempFile(work, ".cloudarchive-barrel-", ".tmp");
+                    pending = FileChannel.open(pendingPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
                 }
+                writeBookBytes(pending, (long) item.slot() * BYTES_PER_BOOK, bookLength);
+                pendingLengths[item.slot()] = bookLength;
+                pendingTitles[item.slot()] = item.title();
             } else {
-                long index = ((long) archiveBook.x() - 1) * INVENTORY_SLOTS + slot;
-                if (index > Integer.MAX_VALUE) {
-                    throw new IOException("Archive data book index is too large");
+                storeBook(item.x(), item.slot(), item.title(), bookLength);
+            }
+            bookLength = 0;
+        }
+
+        private void acceptBarrel(int x) throws IOException {
+            for (int slot = 0; slot < INVENTORY_SLOTS; slot++) {
+                int length = pendingLengths[slot];
+                if (length != 0) {
+                    pending.position((long) slot * BYTES_PER_BOOK);
+                    buffer.clear().limit(length);
+                    readFully(pending, buffer);
+                    storeBook(x, slot, pendingTitles[slot], length);
                 }
-                int dataIndex = (int) index;
-                if (!dataBooks.containsKey(dataIndex)) {
-                    dataBooks.put(dataIndex, writePages(data, pages, index * BYTES_PER_BOOK));
-                } else {
-                    throw new IOException("Archive data contains duplicate book positions");
+            }
+            Arrays.fill(pendingLengths, 0);
+            Arrays.fill(pendingTitles, null);
+            if (pending != null) {
+                pending.truncate(0);
+            }
+        }
+
+        private void storeBook(int x, int slot, String title, int length) throws IOException {
+            if (!(x == 0 ? METADATA_TITLE : DATA_TITLE).equals(title)) {
+                throw new IOException("Archive book title does not match its barrel");
+            }
+            long index = x == 0 ? slot : ((long) x - 1) * INVENTORY_SLOTS + slot;
+            if (index >= Integer.MAX_VALUE) {
+                throw new IOException("Archive data book index is too large");
+            }
+            (x == 0 ? metadataBooks : dataBooks).add(index, length);
+            writeBookBytes(x == 0 ? metadata : data, index * BYTES_PER_BOOK, length);
+        }
+
+        private void writeBookBytes(FileChannel channel, long offset, int length) throws IOException {
+            channel.position(offset);
+            buffer.clear().limit(length);
+            while (buffer.hasRemaining()) {
+                channel.write(buffer);
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                if (pending != null) {
+                    pending.close();
+                }
+            } finally {
+                if (pendingPath != null) {
+                    Files.deleteIfExists(pendingPath);
                 }
             }
         }
 
         private TreeArchiveFormat.Manifest finish(Path metadataPath, Path dataPath, int barrelCount)
                 throws IOException {
-            if (metadataBooks.isEmpty()) {
-                throw new IOException("Archive metadata barrel is missing");
-            }
             TreeArchiveFormat.Manifest manifest = TreeArchiveFormat.read(metadataPath);
             if (barrelCount != 1 + barrelCountForBooks(manifest.dataBookCount())) {
                 throw new IOException("Archive barrel count does not match metadata");
             }
             int expectedMetadataBooks = TreeArchiveFormat.metadataBookCount(Files.size(metadataPath));
-            if (metadataBooks.size() != expectedMetadataBooks) {
-                throw new IOException("Archive metadata books are missing");
-            }
-            long metadataLength = Files.size(metadataPath);
-            for (int index = 0; index < expectedMetadataBooks; index++) {
-                Long size = metadataBooks.get(index);
-                long expected = Math.min(BYTES_PER_BOOK, metadataLength - index * BYTES_PER_BOOK);
-                if (size == null || size != expected) {
-                    throw new IOException("Archive metadata book is missing or incomplete");
-                }
-            }
-            if (dataBooks.size() != manifest.dataBookCount()) {
-                throw new IOException("Archive data books are missing");
-            }
-            for (int index = 0; index < manifest.dataBookCount(); index++) {
-                Long size = dataBooks.get(index);
-                long expected = Math.min(BYTES_PER_BOOK,
-                        manifest.storedLength() - index * BYTES_PER_BOOK);
-                if (size == null || size != expected) {
-                    throw new IOException("Archive data book is missing or incomplete");
-                }
-            }
+            metadataBooks.verify(expectedMetadataBooks, Files.size(metadataPath));
+            dataBooks.verify(manifest.dataBookCount(), manifest.storedLength());
             if (Files.size(dataPath) != manifest.storedLength()) {
                 throw new IOException("Archive stored data size verification failed");
             }
             return manifest;
+        }
+    }
+
+    // Coordinates and slot masks prove uniqueness; only the last book may be partial.
+    private static final class BookLengths {
+        private int count;
+        private long bytes;
+        private long partialIndex = -1;
+
+        private void add(long index, int length) throws IOException {
+            count++;
+            bytes += length;
+            if (length != BYTES_PER_BOOK) {
+                if (partialIndex != -1) {
+                    throw new IOException("Archive contains multiple incomplete books");
+                }
+                partialIndex = index;
+            }
+        }
+
+        private void verify(int expectedCount, long expectedBytes) throws IOException {
+            if (count != expectedCount || bytes != expectedBytes
+                    || partialIndex != -1 && partialIndex != (long) expectedCount - 1) {
+                throw new IOException("Archive books are missing or incomplete");
+            }
         }
     }
 

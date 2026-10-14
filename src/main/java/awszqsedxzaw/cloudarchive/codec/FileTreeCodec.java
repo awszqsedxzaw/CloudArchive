@@ -4,7 +4,6 @@ import awszqsedxzaw.cloudarchive.codec.TreeArchiveFormat.ArchiveKind;
 import awszqsedxzaw.cloudarchive.codec.TreeArchiveFormat.Extent;
 import awszqsedxzaw.cloudarchive.codec.TreeArchiveFormat.Manifest;
 import awszqsedxzaw.cloudarchive.codec.TreeArchiveFormat.Node;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -19,11 +18,11 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
-import java.security.DigestOutputStream;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -92,10 +91,12 @@ public final class FileTreeCodec {
         Path work = Files.createTempDirectory(".cloudarchive-tree-");
         try {
             Path metadata = work.resolve("metadata");
-            Path data = work.resolve("data");
-            MessageDigest dataDigest = LitematicaFileCodec.newSha256();
-            try (OutputStream dataOutput = new DigestOutputStream(
-                    new java.io.BufferedOutputStream(new FileOutputStream(data.toFile())), dataDigest)) {
+            Path stored = work.resolve("stored");
+            HashSet<Long> seenSizes = new HashSet<>();
+            DataCompression.Encoded compressed;
+            String dataHash;
+            byte[] copyBuffer = new byte[64 * 1024];
+            try (DataCompression.Encoder encoder = new DataCompression.Encoder(stored)) {
                 for (Path path : snapshot.paths()) {
                     BasicFileAttributes attributes = snapshot.attributes().get(path);
                     TreeArchiveFormat.validateName(path.getFileName().toString());
@@ -108,33 +109,33 @@ public final class FileTreeCodec {
                     String hash = "";
                     List<Extent> extents = List.of();
                     if (!directory) {
-                        Path staged = work.resolve("source-" + nextId);
-                        hash = copyAndHashSource(path, attributes, staged);
+                        boolean candidate = size > 0 && seenSizes.contains(size);
+                        if (candidate) {
+                            encoder.checkpoint();
+                        }
+                        hash = copyAndHashSource(path, attributes, encoder, copyBuffer);
                         if (size > 0) {
                             String contentKey = hash + ":" + size;
                             Extent previous = duplicateFiles.get(contentKey);
                             if (previous == null) {
                                 extents = List.of(new Extent(contentSize, size));
                                 duplicateFiles.put(contentKey, extents.get(0));
-                                try (InputStream input = Files.newInputStream(staged)) {
-                                    input.transferTo(dataOutput);
-                                }
+                                encoder.commit();
                                 contentSize = TreeArchiveFormat.add(contentSize, size);
                             } else {
                                 extents = List.of(previous);
+                                encoder.rollback();
                             }
+                            seenSizes.add(size);
                         }
-                        Files.delete(staged);
                     }
                     nodes.add(new Node(nextId, parentId, path.getFileName().toString(),
                             directory, size, hash, extents));
                     ids.put(path, nextId++);
                 }
+                compressed = encoder.finish();
+                dataHash = encoder.sha256();
             }
-            String dataHash = HexFormat.of().formatHex(dataDigest.digest());
-            Path stored = work.resolve("stored");
-            DataCompression.Encoded compressed = DataCompression.encode(data, stored);
-            Files.delete(data);
             TreeArchiveFormat.validate(kind, archiveName, nodes, contentSize, nextId);
             TreeArchiveFormat.write(metadata, kind, archiveName, nodes, contentSize, dataHash, nextId,
                     compressed.storedLength(), compressed.blocks());
@@ -172,9 +173,16 @@ public final class FileTreeCodec {
                 throw new IOException("Input is a directory-tree archive, not a single-file archive");
             }
             if (decoded.manifest().kind() == ArchiveKind.FILE) {
-                Path staged = work.resolve("file");
-                extractSingle(decoded.manifest(), work.resolve("data"), staged);
-                Files.move(staged, destination);
+                Node node = decoded.manifest().nodes().get(0);
+                if (node.size() == 0 && node.extents().isEmpty()
+                        || node.extents().equals(List.of(new Extent(0, node.size())))) {
+                    verifyHash(node, decoded.manifest().dataSha256());
+                    Files.move(work.resolve("data"), destination);
+                } else {
+                    Path staged = work.resolve("file");
+                    extractSingle(decoded.manifest(), work.resolve("data"), staged);
+                    Files.move(staged, destination);
+                }
                 return new Summary(decoded.info(), 1, 0, decoded.manifest().dataLength());
             }
             Path tree = Files.createDirectory(work.resolve("tree"));
@@ -280,14 +288,12 @@ public final class FileTreeCodec {
     }
 
     private static String copyAndHashSource(
-            Path source, BasicFileAttributes expected, Path staged
+            Path source, BasicFileAttributes expected, OutputStream output, byte[] buffer
     ) throws IOException {
         requireUnchanged(source, expected);
         MessageDigest digest = LitematicaFileCodec.newSha256();
         long size = 0;
-        try (InputStream input = Files.newInputStream(source);
-             OutputStream output = Files.newOutputStream(staged)) {
-            byte[] buffer = new byte[64 * 1024];
+        try (InputStream input = Files.newInputStream(source)) {
             int count;
             while ((count = input.read(buffer)) != -1) {
                 size = TreeArchiveFormat.add(size, count);

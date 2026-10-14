@@ -137,6 +137,18 @@ public final class Base85CodecBenchmark {
                             + "        }\n"
                             + "        return " + PACKAGE + ".Base85CodecBenchmark.Base85.decode(page);\n"
                             + "    }\n\n" + text.substring(end);
+                    start = text.indexOf("    private static int decodePage(");
+                    end = text.indexOf("    private static ", start + "    private static ".length());
+                    if (start < 0 || end < 0) {
+                        throw new IOException("Cannot locate the streaming page decoder");
+                    }
+                    text = text.substring(0, start)
+                            + "    private static int decodePage(String page, byte[] target, int offset)"
+                            + " throws IOException {\n"
+                            + "        byte[] decoded = decodePage(page);\n"
+                            + "        System.arraycopy(decoded, 0, target, offset, decoded.length);\n"
+                            + "        return decoded.length;\n"
+                            + "    }\n\n" + text.substring(end);
                 }
                 String content = text;
                 sources.add(new SimpleJavaFileObject(URI.create("string:///"
