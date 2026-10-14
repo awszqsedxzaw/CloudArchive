@@ -1,10 +1,14 @@
 # 压缩与转换基准
 
-本文保留历次实验，并在最前面记录当前实现的对照。单位 MB 为 1,000,000 字节，MiB 为 1,048,576 字节。不同批次的预热和实现可能不同，不能混合计算中位数。
+[README](../README.md) · [使用指南](usage.md) · [开发者文档](developer-guide.md) · [归档格式](archive-format.md)
+
+本文保存测量方法、有效结果和复现命令，不作为当前格式规格。当前实现的源码与资源边界见开发者文档。历史实验即使使用相同 `CAMD v2` 名称，也可能有不同书字段或压缩参数，不能据此推断当前读取器兼容历史产物。
+
+先列当前实现对照和大文件验证，再保留全部历史实验。单位 MB 为 1,000,000 字节，MiB 为 1,048,576 字节；“耗时减少”按 `(基线时间 - 新时间) / 基线时间` 计算。不同批次的预热和实现可能不同，不能混合计算中位数。本次文档重构没有重新测量或替换已有结果。
 
 ## 2026-10-14：单次读取与单次 NBT 扫描
 
-基线为优化前提交 `751d14c`，新版为当前实现。同机 Windows、JDK 21、Intel Core i5-1135G7；测量子进程均限制为 `-Xmx128m`。压缩参数、磁盘格式及页容量不变：`CAMD v2`、4 MiB 块、Zstandard 3、Base64、gzip 6。
+基线为优化前提交 `751d14c`，新版实现随提交 `eaf96d3` 保存。同机 Windows、JDK 21、Intel Core i5-1135G7；测量子进程均限制为 `-Xmx128m`。压缩参数、磁盘格式及页容量不变：`CAMD v2`、4 MiB 块、Zstandard 3、Base64、gzip 6。
 
 新版将源文件直接输入流式压缩器，同时计算文件和整体哈希；重复候选通过检查点回滚，不再生成 staging 或完整原始副本。读取采用一次 gzip/NBT 扫描，书页立即解码到固定书缓冲，坐标未知时仅当前木桶暂存到磁盘。取消打包后的完整解压自检，标准连续单文件还原直接移动已经验证的逻辑数据文件。这次对照测量上述整体实现变化，不把收益单独归因于扫描次数。
 
@@ -51,10 +55,11 @@ Java 堆限制不等于进程 RSS；Zstandard 原生 context、线程栈和 JVM 
 
 ### 复现本次对照
 
-每次使用新的输出目录，避免覆盖。基线压缩包和展开源码位于忽略的 `build/`：
+每次使用新的输出目录，避免覆盖；以下默认基线压缩包和展开目录也尚不存在。基线压缩包和展开源码位于忽略的 `build/`：
 
 ```powershell
 $env:JAVA_HOME = 'C:\applications\Java\jdk-21'
+New-Item -ItemType Directory -Path build -Force | Out-Null
 git archive --format=zip --output=build/benchmark-751d14c.zip 751d14c
 Expand-Archive -LiteralPath build/benchmark-751d14c.zip -DestinationPath build/benchmark-751d14c-source
 .\gradlew.bat benchmarkCodecComparison "--args='build/benchmark-751d14c-source' 'C:/everything/workspace/Projects/test/GTMC.zip' 'build/compare-single-pass-zip-repeat' 'C:/everything/workspace/Projects/test/GTMC.zip.litematic' 3" --console=plain
@@ -64,11 +69,13 @@ Expand-Archive -LiteralPath build/benchmark-751d14c.zip -DestinationPath build/b
 
 第五个参数为新旧各运行的次数；第四个参数只读取既有投影的文件大小。原始日志为 `build/compare-single-pass-zip.log`、`build/compare-single-pass-tree.log`；输出投影和还原结果分别位于 `build/compare-single-pass-zip/`、`build/compare-single-pass-tree/`。日志和测试数据不提交 Git；上表保留有效数据。
 
-## 2026-10-13：历史压缩实验
+源码快照需要本地 Git 历史含 `751d14c`；浅克隆需先取得该提交。上面的任务测量“基线与运行命令时的当前工作区”，要严格复现表中实现，应在独立检出中使用 `eaf96d3`，不要覆盖已有工作区。Windows JDK 路径及样本位置需按本机调整。对照任务不包含游戏内运行，也没有测量进程 RSS。
 
-以下保留此前测量。同一台 Windows 机器、JDK 21、128 MiB Java 堆；最初旧实现为提交 `63b1c53`，新实现为当时的 `CAMD v2`。
+## 历史实验
 
-## 输入与方法
+以下保留 2026-10-13 起的测量，后续追加实验按原有结果保存。同一台 Windows 机器、JDK 21、128 MiB Java 堆；最初旧实现为提交 `63b1c53`，新实现为当时的 `CAMD v2`。下文“新”“当前”“本次”等称谓均指各实验当时的实现，不替代开头的版本标记。
+
+### 输入与方法
 
 用户提供的输入位于 `C:\everything\workspace\Projects\test`：
 
@@ -81,7 +88,7 @@ Expand-Archive -LiteralPath build/benchmark-751d14c.zip -DestinationPath build/b
 
 每个进程先用 1 MiB 随机文件预热，再执行三次完整打包和还原。耗时只覆盖编解码器调用，不含 Gradle/JVM 启动，也不含最终比较。每次都比较完整目录结构、节点类型和每个文件的 `Files.mismatch`；六次旧版和六次新版还原全部一致。测试输出位于项目忽略的 `build/`，原始输入和提供的两个投影未修改。
 
-## 历史低内存读取
+### 历史低内存读取
 
 为测量本次改动，使用同一份 `GTMC.zip`、同一台机器和相同的
 `benchmarkFileCodec` 任务分别运行旧提交 `d31d77e` 与当时的低内存实现。旧版在还原时先扫描
@@ -101,7 +108,7 @@ benchmark 都使用 128 MiB 堆，内存条件一致。
 低内存版还原范围为 2.648–14.250 秒，其中 14.250 秒是明显异常值，因此不能据此
 保证所有机器或所有投影稳定达到相同提速。
 
-## 完整结果
+### 完整结果
 
 | 输入 | 版本 | 运行 | 投影字节数 | 打包秒数 | 还原秒数 | 总木桶 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -122,7 +129,7 @@ benchmark 都使用 128 MiB 堆，内存条件一致。
 
 目录去重后逻辑数据为 198,346,890 字节，节省 815,461 字节。Zstandard/RAW 块合计为 167,962,807 字节；最终投影还包含 Base64/NBT、元数据和外层 gzip。这批数据中的重复文件较少，体积收益主要来自分块压缩。
 
-## 书页编码比较
+### 书页编码比较
 
 取 `GTMC.zip` 的前 16 MiB，实际调用 `DataOutputStream.writeUTF` 写书页，接 gzip。每项执行三轮，舍弃首轮，以下为后两轮平均耗时。只比较编码加 gzip，不代表完整打包耗时。
 
@@ -139,7 +146,7 @@ NBT 字符串用 modified UTF-8；多字节字符的开销不能按 Java 字符�
 
 在同一样本上，Zstandard 级别 6 将 16 MiB 压到 16,704,157 字节，压缩平均约 0.103 秒；Deflate 级别 6 得到 16,754,492 字节，平均约 0.475 秒。最终保留 Base64，以 Zstandard 独立块改善书内数据容量，并保持外层 gzip 级别 6 的体积，通过并行生成 gzip 成员提高打包速度。
 
-## Base85 完整流程比较
+### Base85 完整流程比较
 
 同日追加测试，CPU 为 Intel Core i5-1135G7（4 核、8 线程），JDK 21.0.3，测量 JVM 堆为 128 MiB。Base85 使用 Git/Python 的 RFC 1924 字符表，不包含双引号、反斜杠或非 ASCII 字符；尾组不输出填充字符，并检查规范编码与 32 位溢出。完整五字符组对齐后，每页容量从 24,573 增至 26,208 字节（增加 6.65%），每本书为 2,620,800 字节，每个数据木桶为 70,761,600 字节。
 
@@ -185,7 +192,7 @@ $env:JAVA_HOME = 'C:\applications\Java\jdk-21'
 
 该任务仅供实验，Base85 投影不能由正式的 Base64 读取器还原。以上数据记录的是后续速度优化之前的实现；重新运行使用届时的项目代码，耗时可能不同。
 
-## Zstandard 与 gzip 参数比较
+### Zstandard 与 gzip 参数比较
 
 在上述两个 Base64 投影上追加测试。先验证并还原出唯一逻辑数据，然后比较 Zstandard 静态调用、复用上下文、两个原生工作线程，以及级别 1、3、6、9、12。仍使用 4 MiB 独立块，压缩结果不够小时使用 RAW；不升级 zstd-jni 1.5.2-5。每项先预热，再测三轮，第二轮反转顺序。所有压缩结果都通过现有解码器的整体 SHA-256 校验；复用上下文与静态调用在级别 6 的帧逐字节相同。
 
@@ -235,7 +242,7 @@ $env:JAVA_HOME = 'C:\applications\Java\jdk-21'
 .\gradlew.bat benchmarkCompressionTuning "--args='out\current-tree.litematic' 'build\tune-tree-repeat' 3"
 ```
 
-## 保留 Base64 的实现优化
+### 保留 Base64 的实现优化
 
 以下为切换级别 3 之前的测量。参数测试后，在正式编解码器中落实三项优化，当时保持 `CAMD v2`、4 MiB 块、Zstandard 6、gzip 6 和书页容量：
 
@@ -300,7 +307,7 @@ ZIP 还原时间范围由 5.404～5.647 秒降至 4.250～4.350 秒；目录由 
 
 有效原始日志为 `build/opt-b85-zip.log` 和 `build/obt.log`；格式检查日志为 `build/optimization-check.log`。目录首次优化后测试在最后一次 Base85 还原的目录移动阶段遇到 Windows 拒绝访问，日志为 `build/opt-b85-tree.log`，未计入上表；换用新短路径后，三轮完整对照全部逐文件、逐字节比较通过。另一次常规 ZIP 测试记录在 `build/opt-zip.log`，预热方法不同，不混入上述统计。复现使用与前面相同的 `benchmarkBase85` 命令和新的输出目录。
 
-## 级别 3 与精简字段
+### 级别 3 与精简字段
 
 最终按速度优先的取舍，将正式 Zstandard 写入级别改为 3，外层 gzip 仍为 6。Base64 使用 JDK 编码器的写入现有数组接口，复用每本书的输入数组、输出数组和 `ByteBuffer`；末尾不足一页时裁剪输入，避免编码旧缓冲区的残留内容。保留前述查表校验、按页直接写 NBT 和 Zstandard 上下文复用。
 
@@ -326,7 +333,7 @@ $env:JAVA_HOME = 'C:\applications\Java\jdk-21'
 .\gradlew.bat benchmarkFileCodec "--args='C:\everything\workspace\Projects\test\GTMC.zip' 'build\l3zip-repeat' 'build\opt-b85-zip\run-1-base64.litematic' 1" --console=plain
 ```
 
-## 复现
+### 历史任务复现
 
 以下任务可以测试任何文件或目录，不依赖已删除的旧格式读取器：
 
